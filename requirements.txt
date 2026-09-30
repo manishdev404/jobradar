@@ -6,3 +6,6 @@ pypdf>=4.2
 typesafe-sdk
 fastapi>=0.110
 uvicorn[standard]>=0.29
+
+# Only needed for `import-applied` on .xlsx files.
+openpyxl>=3.1

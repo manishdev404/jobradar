@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
@@ -23,6 +24,7 @@ from . import sources
 from .budget import Budget
 from .cursor import CursorError
 from .llm import RateLimited, make_scorer
+from .experience import too_senior
 from .localmatch import LocalScorer
 from .resume import build_profile, extract_text
 from .relevance import apply_cap as apply_relevance_cap
@@ -51,6 +53,15 @@ def get_scorer(cfg: dict):
 
 
 def get_profile(cfg: dict, scorer, force: bool = False) -> str:
+    """The resume profile plus config's candidate_notes - what you are looking
+    for, which a resume does not say. Notes go first so the 1,400-character
+    prompt cut can never drop them."""
+    notes = (cfg.get("candidate_notes") or "").strip()
+    base = _resume_profile(cfg, scorer, force)
+    return f"TARGET: {notes}\n{base}" if notes else base
+
+
+def _resume_profile(cfg: dict, scorer, force: bool = False) -> str:
     resume_path = ROOT / cfg["resume_path"] if not Path(cfg["resume_path"]).is_absolute() \
         else Path(cfg["resume_path"])
     stamp = resume_path.stat().st_mtime if resume_path.exists() else 0
@@ -85,20 +96,38 @@ def passes_filters(job: dict, f: dict) -> bool:
         return False
     if any(s in title for s in exc):
         return False
-    if locs and not any(s in job["location"].lower() for s in locs):
+    # Whole words: "india" must not match "Indianapolis" or "Indiana".
+    if locs and not any(re.search(rf"\b{re.escape(s)}\b", job["location"].lower()) for s in locs):
+        return False
+    # Read from the full fetched description, before the store trims it.
+    if too_senior(job, f.get("max_required_years")):
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
 
-def cmd_scan(cfg: dict, store: Store, quiet: bool = False) -> dict:
+def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False) -> dict:
     all_jobs: list[dict] = []
     errors: list[str] = []
     healthy_companies: list[str] = []
 
-    for entry in cfg.get("companies", []):
-        jobs, err = sources.fetch_company(entry)
+    # A board read within refresh_hours is skipped: postings rarely change by
+    # the hour, and skipping leaves its jobs untouched (a skipped board is not
+    # "healthy" this run, so nothing of it is marked closed). --full reads all.
+    fresh = set() if full else store.fresh_boards(float(cfg.get("refresh_hours", 0) or 0))
+    entries = [e for e in cfg.get("companies", []) if e["name"] not in fresh]
+    if fresh and not quiet:
+        print(f"  skipping {len(fresh)} boards read in the last {cfg.get('refresh_hours')}h "
+              f"(scan --full to read them anyway)", flush=True)
+
+    # Boards are independent and fetching is network-bound, so fetch them in
+    # parallel. map() keeps config order for the printout; fetch_company never
+    # raises, so one dead board cannot take down the pool.
+    with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
+        fetched = list(pool.map(sources.fetch_company, entries))
+
+    for entry, (jobs, err) in zip(entries, fetched):
         if err:
             errors.append(f"{entry['name']}: {err}")
         else:
@@ -122,6 +151,11 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False) -> dict:
 
     new = store.upsert(kept)
     closed = store.mark_closed(healthy_companies)
+    counts = {e["name"]: len(j) for e, (j, err) in zip(entries, fetched) if not err}
+    for name in healthy_companies:
+        store.mark_fetched(name, counts.get(name, 0))
+    # A job you applied to before Job Radar tracked it is recognised now.
+    store.link_applications()
 
     # --- score the new arrivals -------------------------------------------
     llm_cfg = cfg.get("llm", {})
@@ -220,7 +254,7 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False) -> dict:
                     payload = []
                     for row in chunk:
                         job = dict(row)
-                        job["description"] = desc.get(row["id"], "")
+                        job["description"] = (desc.get(row["id"]) or row["description"] or "")
                         payload.append(job)
                     return scorer.score_batch(profile, payload)
 
@@ -296,7 +330,7 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False) -> dict:
 
                 def work(row):
                     job = dict(row)
-                    job["description"] = desc.get(row["id"], "")
+                    job["description"] = (desc.get(row["id"]) or row["description"] or "")
                     return row, scorer.score(profile, job)
 
                 with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -324,12 +358,15 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False) -> dict:
     return {"new": len(new), "closed": len(closed), "errors": errors}
 
 
-def cmd_digest(cfg: dict, store: Store, days: int, dry_run: bool) -> None:
+def cmd_digest(cfg: dict, store: Store, days: int, dry_run: bool,
+               new_only: bool = False) -> None:
     llm_cfg = cfg.get("llm", {})
     min_score = llm_cfg.get("min_score", 0)
     scoring_on = llm_cfg.get("provider", "none") not in ("none", None, "")
     pending = store.unnotified(min_score, require_scored=scoring_on)
-    closed = store.closed_since(days * 86400)
+    # Frequent runs (every couple of hours) mail only new openings: repeating
+    # the week's closures each time would send the same email all day.
+    closed = [] if new_only else store.closed_since(days * 86400)
 
     # Cap what one email shows. The first run after a fresh scan has the entire
     # board pending - thousands of jobs - and mailing all of them is useless.
@@ -338,7 +375,7 @@ def cmd_digest(cfg: dict, store: Store, days: int, dry_run: bool) -> None:
     cap = int(cfg.get("digest", {}).get("max_jobs", 60))
     new = pending[:cap]
     overflow = len(pending) - len(new)
-    label = time.strftime("Week of %d %b %Y")
+    label = time.strftime("Update %d %b %Y, %H:%M" if new_only else "Week of %d %b %Y")
     notes = []
     if overflow > 0:
         notes.append(f"Showing the top {len(new)} of {len(pending)} tracked openings; "
@@ -444,14 +481,33 @@ def cmd_list(store: Store, days: int) -> None:
         print(f"[{s}] {r['title'][:60]:<60} {r['company'][:18]:<18} {r['url']}")
 
 
+def cmd_applied(store: Store, status: str = "") -> None:
+    rows = [r for r in store.applications() if not status or r["status"] == status]
+    if not rows:
+        print("No applications recorded.")
+        return
+    for r in rows:
+        when = time.strftime("%Y-%m-%d", time.localtime(r["applied_at"])) if r["applied_at"] \
+            else "    -     "
+        print(f"{when}  {r['status']:<11} {r['company'][:22]:<22} {r['title'][:45]:<45} {r['url']}")
+    print(f"\n{len(rows)} applications")
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="jobradar")
     p.add_argument("--config", default=str(ROOT / "config.yaml"))
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("scan")
+    sc = sub.add_parser("scan")
+    sc.add_argument("--full", action="store_true", help="read every board, even fresh ones")
+    ia = sub.add_parser("import-applied", help="import an .xlsx/.csv application tracker")
+    ia.add_argument("path")
+    ap = sub.add_parser("applied", help="list your application history")
+    ap.add_argument("--status", default="", help="only this status, e.g. applied")
     d = sub.add_parser("digest"); d.add_argument("--days", type=int, default=7)
+    d.add_argument("--new-only", action="store_true", help="email only new openings")
     d.add_argument("--dry-run", action="store_true")
     r = sub.add_parser("run"); r.add_argument("--days", type=int, default=7)
+    r.add_argument("--new-only", action="store_true", help="email only new openings")
     r.add_argument("--dry-run", action="store_true")
     l = sub.add_parser("list"); l.add_argument("--days", type=int, default=7)
     a = sub.add_parser("alert"); a.add_argument("--dry-run", action="store_true")
@@ -463,12 +519,19 @@ def main(argv=None) -> None:
     store = Store(ROOT / "jobradar.db")
 
     if args.cmd == "scan":
-        cmd_scan(cfg, store)
+        cmd_scan(cfg, store, full=args.full)
+    elif args.cmd == "import-applied":
+        from .applied import import_file
+        got = import_file(Path(args.path), store)
+        print(f"Imported {got['added']} applications ({got['skipped']} already there) "
+              f"from sheets: {', '.join(got['sheets']) or 'none with a Company column'}.")
+    elif args.cmd == "applied":
+        cmd_applied(store, args.status)
     elif args.cmd == "digest":
-        cmd_digest(cfg, store, args.days, args.dry_run)
+        cmd_digest(cfg, store, args.days, args.dry_run, args.new_only)
     elif args.cmd == "run":
         cmd_scan(cfg, store)
-        cmd_digest(cfg, store, args.days, args.dry_run)
+        cmd_digest(cfg, store, args.days, args.dry_run, args.new_only)
     elif args.cmd == "list":
         cmd_list(store, args.days)
     elif args.cmd == "recap":
