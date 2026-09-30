@@ -24,13 +24,18 @@ class RateLimited(Exception):
 ENDPOINTS = {
     "xkiro":      ("https://api.xkiro.com/v1/chat/completions",       "XKIRO_API_KEY"),
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions",   "OPENROUTER_API_KEY"),
+    "xai":        ("https://api.x.ai/v1/chat/completions",            "XAI_API_KEY"),
+    "groq":       ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY"),
     "ollama":     ("http://localhost:11434/v1/chat/completions",      None),
 }
 
 
 class LLM:
-    def __init__(self, provider: str, model: str):
+    def __init__(self, provider: str, model: str, params: dict | None = None):
         self.provider = provider
+        # Extra request-body fields from llm.model_params, e.g. reasoning_effort
+        # for Groq's gpt-oss models, whose reasoning otherwise eats max_tokens.
+        self.params = dict(params or {})
         if provider not in ENDPOINTS:
             raise ValueError(f"unknown provider '{provider}'")
         self.url, env = ENDPOINTS[provider]
@@ -38,6 +43,7 @@ class LLM:
         self._lock = threading.Lock()   # one thread waits out a window, not all of them
         self.input_tokens = 0
         self.output_tokens = 0
+        self._need = 0          # tokens the last request reserved; see _pace
         self.key = os.environ.get(env, "") if env else ""
         if env and (not self.key or self.key.startswith("paste-your")):
             raise RuntimeError(f"set {env} in your environment (free key, no card needed)")
@@ -49,7 +55,9 @@ class LLM:
             remaining = int(headers.get("x-ratelimit-remaining-tokens", "999999"))
         except ValueError:
             return
-        if remaining > 1500:
+        # Groq and friends reserve prompt + max_tokens up front, so "low" means
+        # less than the next request of this size will need, not a fixed floor.
+        if remaining > max(1500, self._need):
             return
         reset = headers.get("x-ratelimit-reset-tokens", "")
         secs = 0.0
@@ -77,6 +85,7 @@ class LLM:
             "messages": messages,
             "temperature": 0.2,
             "max_tokens": max_tokens,
+            **self.params,
         }
         for attempt in range(retries):
             r = requests.post(self.url, headers=headers, json=body, timeout=60)
@@ -99,9 +108,10 @@ class LLM:
                         f"Check the current model list. ({detail})"
                     )
                 raise RuntimeError(f"{self.provider} HTTP {r.status_code}: {detail}")
-            self._pace(r.headers)
             payload = r.json()
             usage = payload.get("usage") or {}
+            self._need = (usage.get("prompt_tokens", 0) or 0) + max_tokens
+            self._pace(r.headers)
             self.input_tokens += usage.get("prompt_tokens", 0) or 0
             self.output_tokens += usage.get("completion_tokens", 0) or 0
             text = payload["choices"][0]["message"]["content"]
@@ -170,9 +180,9 @@ class ChatScorer:
 
     batch_size = 25
 
-    def __init__(self, provider: str, model: str):
+    def __init__(self, provider: str, model: str, params: dict | None = None):
         self.provider = provider
-        self.llm = LLM(provider, model)
+        self.llm = LLM(provider, model, params)
         self.input_tokens = 0
 
     def score_batch(self, profile: str, jobs: list[dict]) -> dict[str, tuple]:
@@ -184,6 +194,11 @@ class ChatScorer:
         # ~45 output tokens per job plus slack; capping this stops a model
         # rambling into a bill.
         cap = min(4000, 120 + 60 * len(jobs))
+        # Reasoning models (gpt-oss) spend part of max_tokens thinking before
+        # they answer; without headroom the reply is cut off and the whole
+        # batch is dropped and paid for twice.
+        if "reasoning_effort" in self.llm.params:
+            cap += 1000
         text = self.llm.chat(batch.build_messages(profile, jobs), max_tokens=cap)
         return batch.parse(text, jobs)
 
@@ -213,4 +228,4 @@ def make_scorer(provider: str, model: str, params: dict | None = None):
     if provider == "jev":
         from .jev import JevScorer
         return JevScorer(model)
-    return ChatScorer(provider, model)
+    return ChatScorer(provider, model, params)
