@@ -1,8 +1,8 @@
 #!/bin/bash
-# Copy to run.sh and fill in your keys. run.sh is gitignored.
+# Copy to run.sh. Secrets go in .env (see .env.example), not here.
 cd "$(dirname "$0")" || exit 1
+. ./load-env.sh
+export PYTHONIOENCODING=utf-8   # log files on Windows default to cp1252 and choke on ⚠ / —
 
-export XKIRO_API_KEY="your-key-here"
-export JOBRADAR_SMTP_PASSWORD="your-gmail-app-password"
-
-exec ./.venv/bin/python -m jobradar.main "${@:-run}" >> jobradar.log 2>&1
+PY=./.venv/bin/python; [ -x "$PY" ] || PY=./.venv/Scripts/python
+exec "$PY" -m jobradar.main "${@:-run}" >> jobradar.log 2>&1
