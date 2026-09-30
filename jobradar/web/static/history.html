@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Apply History</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◎</span><span class="brandname">Job Radar</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="label">Tracked</div><div class="value" id="h-total">0</div></div>
+    <div class="stat"><div class="label">Applied</div><div class="value" id="h-applied">0</div></div>
+    <div class="stat"><div class="label">In process</div><div class="value" id="h-process">0</div></div>
+    <div class="stat"><div class="label">Interviews</div><div class="value" id="h-int">0</div></div>
+  </div>
+</header>
+
+<div class="titlerow">
+  <h1>Job apply history</h1>
+  <div class="controls">
+    <input id="hq" class="search" type="search" autocomplete="off"
+           placeholder="Search company, role, skill, notes">
+    <button id="csv" class="navbtn" type="button">Download CSV</button>
+    <a class="navbtn" href="/">← Back to jobs</a>
+  </div>
+</div>
+
+<div class="hwrap">
+  <div class="hsum" id="hsum"></div>
+  <div class="tablewrap">
+    <table class="hist">
+      <thead><tr>
+        <th>Date</th><th>Company / role</th><th>Exp. asked</th><th>Top skills</th>
+        <th>Status</th><th>Match</th><th>Notes</th><th></th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="8" class="empty">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <form class="addrow" id="addform" autocomplete="off">
+    <input name="company" placeholder="Company *" required>
+    <input name="title" placeholder="Role">
+    <input name="url" placeholder="Job link">
+    <select name="status" class="stsel" id="addstatus"></select>
+    <button class="scanbtn" type="submit">Add application</button>
+  </form>
+</div>
+
+<script src="/static/history.js"></script>
+</body>
+</html>

@@ -3,6 +3,7 @@
   --tile:#f4f5f7; --panel:#ffffff;
   --g1:#e9f5ee; --g2:#cfead9; --g3:#a9dcbf; --g4:#7fcba2; --g5:#4fb583;
   --accent:#111214;
+  --st-proc:#d9822b; --st-app:#3b82f6; --st-good:#16a34a; --st-bad:#9ca3af;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -10,6 +11,7 @@
     --tile:#17191d; --panel:#111316;
     --g1:#16251d; --g2:#1c3a2a; --g3:#245040; --g4:#2f6d52; --g5:#43a273;
     --accent:#f2f3f5;
+    --st-proc:#f0a04b; --st-app:#60a5fa; --st-good:#4ade80; --st-bad:#6b7280;
   }
 }
 :root[data-theme="dark"]{
@@ -17,6 +19,7 @@
   --tile:#17191d; --panel:#111316;
   --g1:#16251d; --g2:#1c3a2a; --g3:#245040; --g4:#2f6d52; --g5:#43a273;
   --accent:#f2f3f5;
+  --st-proc:#f0a04b; --st-app:#60a5fa; --st-good:#4ade80; --st-bad:#6b7280;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
@@ -151,3 +154,61 @@ main{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:20px;padding:0 2
   .mm-tile{width:84px;height:84px}
   .mm-head{font-size:21px}
 }
+
+
+/* ---- application status ---- */
+.tile[data-st]::after{content:"";position:absolute;top:3px;right:3px;width:8px;height:8px;
+  border-radius:50%;border:1.5px solid var(--bg);background:var(--st-app)}
+.tile[data-st="in_process"]::after,.tile[data-st="referral"]::after{background:var(--st-proc)}
+.tile[data-st="interview"]::after,.tile[data-st="offer"]::after,
+.tile[data-st="assessment"]::after{background:var(--st-good)}
+.tile[data-st="rejected"]::after,.tile[data-st="expired"]::after,
+.tile[data-st="withdrawn"]::after{background:var(--st-bad)}
+.tile.sel{border-color:var(--accent)}
+.navbtn{border:1px solid var(--line);border-radius:8px;padding:8px 14px;font-size:13px;
+  font-weight:600;color:var(--ink);text-decoration:none;background:var(--panel);white-space:nowrap}
+.navbtn:hover{border-color:var(--accent)}
+
+.seljob .sj-title{font-size:15px;font-weight:650;margin-top:2px;line-height:1.3}
+.seljob .sj-meta{color:var(--muted);font-size:12.5px;margin-top:2px}
+.seljob .sj-reason{font-size:12.5px;margin-top:6px;opacity:.8}
+.seljob .sj-actions{display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap}
+.seljob .sj-open{font-size:13px;font-weight:600;color:var(--ink)}
+.seljob .sj-saved{font-size:12px;color:var(--st-good)}
+.stsel{padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  color:var(--ink);font-size:13px;font-family:inherit}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:600;
+  background:var(--tile);white-space:nowrap}
+.pill.in_process,.pill.referral{color:var(--st-proc)}
+.pill.applied,.pill.contacted{color:var(--st-app)}
+.pill.assessment,.pill.interview,.pill.offer{color:var(--st-good)}
+.pill.rejected,.pill.expired,.pill.withdrawn,.pill.not_applied{color:var(--muted)}
+
+/* ---- history page ---- */
+.hwrap{padding:0 20px 32px}
+.hsum{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}
+.hsum button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:999px;
+  padding:5px 12px;font-size:12.5px;cursor:pointer;font-family:inherit}
+.hsum button.on{border-color:var(--accent);font-weight:650}
+.hsum b{font-variant-numeric:tabular-nums;margin-left:4px}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+table.hist{width:100%;border-collapse:collapse;font-size:13px;min-width:960px}
+.hist th{text-align:left;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);font-weight:600;padding:10px 12px;border-bottom:1px solid var(--line);
+  background:var(--panel);position:sticky;top:0}
+.hist td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+.hist tr:last-child td{border-bottom:none}
+.hist .co{font-weight:600}
+.hist .sub{color:var(--muted);font-size:12px}
+.hist .num{font-variant-numeric:tabular-nums;white-space:nowrap}
+.hist a{color:var(--ink)}
+.hist .notes{width:100%;min-width:160px;border:1px solid transparent;border-radius:6px;padding:4px 6px;
+  background:transparent;color:var(--ink);font:inherit;font-size:12.5px}
+.hist .notes:hover,.hist .notes:focus{border-color:var(--line);background:var(--panel)}
+.hist .del{border:0;background:none;color:var(--muted);cursor:pointer;font-size:15px}
+.hist .del:hover{color:#e5484d}
+.addrow{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 0}
+.addrow input{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  color:var(--ink);font:inherit;font-size:13px;min-width:150px;flex:1}
+.empty{padding:36px;text-align:center;color:var(--muted)}
+@media (max-width:640px){.hwrap{padding:0 16px 24px}}

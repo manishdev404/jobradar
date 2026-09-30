@@ -34,7 +34,15 @@
       <option value="8">8+</option>
     </select>
     <select id="co" class="sel" title="Company"><option value="">all companies</option></select>
+    <select id="stfilter" class="sel" title="Application status">
+      <option value="">any status</option>
+      <option value="none">not applied yet</option>
+      <option value="in_process">in process</option>
+      <option value="applied">applied</option>
+      <option value="any">all I've acted on</option>
+    </select>
     <label class="chk"><input type="checkbox" id="newonly"> new this week</label>
+    <a class="navbtn" href="/history">Job apply history</a>
     <button id="scan" class="scanbtn">Scan</button>
   </div>
 </div>
@@ -67,6 +75,9 @@
         <div class="lk-score" id="lk-score"></div>
       </div>
     </div>
+
+    <div class="kicker sec">Selected job</div>
+    <div class="seljob" id="seljob"><div class="muted">click a tile to see the job and set its status</div></div>
 
     <div class="kicker sec">Experience</div>
     <ul class="exp" id="exp"><li class="muted">loading…</li></ul>

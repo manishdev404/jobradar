@@ -39,11 +39,88 @@ function attachLogo(el, job, px) {
 
 function makeTile(job) {
   const el = document.createElement("div");
-  el.className = "tile " + bucket(job.score);
-  el.title = `${job.title} — ${job.company}` + (job.score !== null ? ` · ${job.score}/10` : "");
+  el.className = "tile " + bucket(job.score) + (selectedId === job.id ? " sel" : "");
+  el.title = `${job.title} — ${job.company}` + (job.score !== null ? ` · ${job.score}/10` : "") +
+    (job.app_status ? ` · ${STATUS_LABEL[job.app_status] || job.app_status}` : "");
+  if (job.app_status && job.app_status !== "not_applied") el.dataset.st = job.app_status;
   attachLogo(el, job);
-  el.onclick = () => { if (job.url) window.open(job.url, "_blank", "noopener"); };
+  el.onclick = () => selectJob(job);
+  el.ondblclick = () => { if (job.url) window.open(job.url, "_blank", "noopener"); };
   return el;
+}
+
+// --- application status ------------------------------------------------------
+const STATUS_LABEL = {
+  not_applied: "Not applied", in_process: "In process", referral: "Referral",
+  applied: "Applied", contacted: "Contacted", assessment: "Assessment",
+  interview: "Interview", offer: "Offer", rejected: "Rejected",
+  expired: "Expired", withdrawn: "Withdrawn",
+};
+let selectedId = null;
+
+function statusSelect(current, onChange) {
+  const sel = document.createElement("select");
+  sel.className = "stsel";
+  for (const [value, label] of Object.entries(STATUS_LABEL)) {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = label;
+    sel.appendChild(o);
+  }
+  sel.value = current || "not_applied";
+  sel.onchange = () => onChange(sel.value);
+  return sel;
+}
+
+function selectJob(job) {
+  if (selectedId) tiles.get(selectedId)?.classList.remove("sel");
+  selectedId = job.id;
+  tiles.get(job.id)?.classList.add("sel");
+  renderChecks(job);
+
+  const box = $("seljob");
+  box.textContent = "";
+  const title = document.createElement("div");
+  title.className = "sj-title"; title.textContent = job.title;
+  const meta = document.createElement("div");
+  meta.className = "sj-meta";
+  meta.textContent = [job.company, job.location,
+    job.score !== null && job.score !== undefined ? `${job.score}/10` : "not scored yet"]
+    .filter(Boolean).join(" · ");
+  box.append(title, meta);
+  if (job.reason) {
+    const why = document.createElement("div");
+    why.className = "sj-reason"; why.textContent = job.reason;
+    box.appendChild(why);
+  }
+  const actions = document.createElement("div");
+  actions.className = "sj-actions";
+  const saved = document.createElement("span");
+  saved.className = "sj-saved";
+  const sel = statusSelect(job.app_status, async (status) => {
+    saved.textContent = "saving…";
+    try {
+      const r = await fetch(`/api/jobs/${encodeURIComponent(job.id)}/status`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || r.status);
+      job.app_status = status;
+      saved.textContent = "saved to history";
+      renderGrid();
+    } catch (e) {
+      saved.textContent = `not saved: ${e.message}`;
+      sel.value = job.app_status || "not_applied";
+    }
+  });
+  actions.appendChild(sel);
+  if (job.url) {
+    const open = document.createElement("a");
+    open.className = "sj-open"; open.href = job.url; open.target = "_blank"; open.rel = "noopener";
+    open.textContent = "Open posting ↗";
+    actions.appendChild(open);
+  }
+  actions.appendChild(saved);
+  box.appendChild(actions);
 }
 
 function addInitial(el, company) {
@@ -62,7 +139,16 @@ function currentFilter() {
     min: Number($("minscore").value || 0),
     company: $("co").value || "",
     newOnly: $("newonly").checked,
+    status: $("stfilter").value || "",
   };
+}
+
+function statusMatches(job, want) {
+  const st = job.app_status && job.app_status !== "not_applied" ? job.app_status : "";
+  if (!want) return true;
+  if (want === "none") return !st;
+  if (want === "any") return !!st;
+  return st === want;
 }
 
 // Ids matching the current text query, resolved server-side so descriptions
@@ -75,6 +161,7 @@ function matches(job, f) {
   if (f.min && (job.score === null || job.score === undefined || job.score < f.min)) return false;
   if (f.newOnly && (!job.first_seen || Date.now() / 1000 - job.first_seen > WEEK)) return false;
   if (f.q && searchIds && !searchIds.has(job.id)) return false;
+  if (!statusMatches(job, f.status)) return false;
   return true;
 }
 
@@ -104,7 +191,7 @@ function renderGrid() {
     grid.appendChild(el);
     shown++;
   }
-  const filtered = f.q || f.min || f.company || f.newOnly;
+  const filtered = f.q || f.min || f.company || f.newOnly || f.status;
   if (!jobs.length) {
     $("gridnote").textContent = "no jobs yet — press Scan";
   } else if (!shown) {
@@ -114,7 +201,7 @@ function renderGrid() {
   } else {
     $("gridnote").textContent =
       (filtered ? `${shown} of ${jobs.length} jobs` : `${jobs.length} jobs`) +
-      " · click a tile to open it";
+      " · click a tile to select it, double-click to open the posting";
   }
 }
 
@@ -388,6 +475,7 @@ $("q").addEventListener("input", onFilterChange);
 $("minscore").addEventListener("change", renderGrid);
 $("co").addEventListener("change", renderGrid);
 $("newonly").addEventListener("change", renderGrid);
+$("stfilter").addEventListener("change", renderGrid);
 $("q").addEventListener("keydown", (e) => {
   if (e.key === "Escape") { $("q").value = ""; searchIds = null; renderGrid(); }
 });
