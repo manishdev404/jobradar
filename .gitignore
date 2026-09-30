@@ -1,8 +1,11 @@
 # secrets and personal data — never commit these
 run.sh
+.env
+/resumes/
+/private/
 config.yaml
-resume.*
-!resume.example.txt
+/resume.*
+!/resume.example.txt
 .resume_profile.json
 .resume_details.json
 
@@ -16,3 +19,7 @@ digest_preview.html
 alert_preview.html
 
 .DS_Store
+.ENV
+.env
+/resumes/
+/private/
