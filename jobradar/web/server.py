@@ -21,8 +21,11 @@ from pydantic import BaseModel
 from .. import sources
 from ..cursor import CursorError
 from ..llm import RateLimited
-from ..main import ROOT, get_profile, get_scorer, load_config, passes_filters
+from ..main import (ROOT, boards_due, get_profile, get_scorer, load_config, select_jobs,
+                    start_crawl)
 from ..resume import build_details, extract_text, parse_details
+from ..relevance import apply_cap as apply_relevance_cap
+from ..seniority import apply_cap
 from ..store import STATUSES, Store
 
 STATIC = Path(__file__).parent / "static"
@@ -123,6 +126,147 @@ def delete_application(app_id: int):
     return {"deleted": app_id}
 
 
+# --- AI apply engine ------------------------------------------------------------
+
+_engine = None
+
+
+def engine():
+    """One engine per server: it owns the browser window."""
+    global _engine
+    if _engine is None:
+        import os
+        from ..apply.engine import Engine
+        # JOBRADAR_APPLY_DRY_RUN=1: fill every page but stop before Submit.
+        _engine = Engine(ROOT, llm_factory=lambda: get_scorer(cfg()),
+                         dry_run=bool(os.environ.get("JOBRADAR_APPLY_DRY_RUN")))
+    return _engine
+
+
+class QueueIn(BaseModel):
+    job_ids: list[str]
+
+
+class ResumeIn(BaseModel):
+    answer: str | None = None
+
+
+def _apply_settings() -> dict:
+    from ..apply.answers import Profile
+    try:
+        return Profile(ROOT).engine
+    except FileNotFoundError:
+        return {}
+
+
+@app.get("/apply")
+def apply_page():
+    return FileResponse(str(STATIC / "apply.html"))
+
+
+@app.post("/api/apply/queue")
+def apply_enqueue(body: QueueIn):
+    """Add jobs to the apply queue. A job below min_match_score_to_apply, at a
+    company in skip_companies, or already applied to is refused with why."""
+    s, rules = store(), _apply_settings()
+    floor = rules.get("min_match_score_to_apply")
+    skip = {c.lower() for c in rules.get("skip_companies") or []}
+    added, refused = [], []
+    for jid in body.job_ids:
+        job = s.db.execute("SELECT company, title, score FROM jobs WHERE id = ?", (jid,)).fetchone()
+        if job is None:
+            refused.append({"id": jid, "why": "no such job"})
+            continue
+        if job["company"].lower() in skip:
+            refused.append({"id": jid, "why": f"{job['company']} is in skip_companies"})
+            continue
+        if floor is not None and job["score"] is not None and job["score"] < float(floor):
+            refused.append({"id": jid, "why": f"match {job['score']}/10 is below {floor}"})
+            continue
+        try:
+            s.enqueue(jid)
+            added.append(jid)
+        except ValueError as e:
+            refused.append({"id": jid, "why": str(e)})
+    return {"added": added, "refused": refused}
+
+
+@app.delete("/api/apply/queue/{app_id}")
+def apply_dequeue(app_id: int):
+    s = store()
+    row = s.db.execute("SELECT status FROM applications WHERE id = ?", (app_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "not in the queue")
+    if row["status"] in ("applying", "needs_you"):
+        raise HTTPException(409, "being applied to now - use Skip")
+    s.update_application(app_id, "not_applied", notes="removed from the apply queue")
+    return {"removed": app_id}
+
+
+@app.get("/api/apply/state")
+def apply_state():
+    s = store()
+    queue = [dict(r) for r in s.apply_queue()]
+    for q in queue:
+        q.pop("notes", None)
+    return {"engine": engine().snapshot(), "queue": queue,
+            "done": [dict(r) for r in s.engine_done(20)],
+            "settings": _apply_settings()}
+
+
+@app.get("/api/apply/screen.jpg")
+def apply_screen():
+    from fastapi.responses import Response
+    img = engine().screen()
+    if not img:
+        raise HTTPException(404, "no picture yet")
+    return Response(img, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/apply/start")
+def apply_start():
+    return {"started": engine().start()}
+
+
+@app.post("/api/apply/stop")
+def apply_stop():
+    engine().stop()
+    return {"stopping": True}
+
+
+@app.post("/api/apply/resume")
+def apply_resume(body: ResumeIn):
+    engine().resume(body.answer)
+    return {"resumed": True}
+
+
+@app.post("/api/apply/skip")
+def apply_skip():
+    engine().skip()
+    return {"skipping": True}
+
+
+@app.get("/api/apply/proof/{app_id}")
+def apply_proof(app_id: int):
+    row = store().db.execute("SELECT proof FROM applications WHERE id = ?", (app_id,)).fetchone()
+    if row is None or not row["proof"]:
+        raise HTTPException(404, "no screenshot")
+    path = (ROOT / row["proof"]).resolve()
+    if ROOT.resolve() not in path.parents or not path.exists():
+        raise HTTPException(404, "no screenshot")
+    return FileResponse(str(path))
+
+
+@app.get("/api/skills")
+def skills():
+    """Resume skills ranked most-done first, and what MERN / Python jobs ask for."""
+    from ..skill import report_for
+    try:
+        return report_for(ROOT, cfg(), store())
+    except Exception as e:  # noqa: BLE001 - no resume: an empty panel, not a 500
+        return {"skills": [], "tracks": [], "error": f"{type(e).__name__}: {e}"[:200]}
+
+
 @app.get("/api/profile")
 def profile():
     c = cfg()
@@ -158,20 +302,27 @@ def state():
     c, s = cfg(), store()
     rows = s.db.execute(
         """SELECT id, company, title, url, location, score, reason, domain, source,
-                  breakdown, first_seen, closed_at,
+                  breakdown, first_seen, closed_at, experience, role, role_rank, role_bonus,
                   (SELECT a.status FROM applications a WHERE a.job_id = jobs.id
                    ORDER BY a.updated_at DESC LIMIT 1) AS app_status
            FROM jobs
            WHERE closed_at IS NULL          -- an expired posting is not a job
-           ORDER BY score DESC NULLS LAST, company, title"""
+           ORDER BY score + role_bonus DESC NULLS LAST, role_rank, company, title"""
     ).fetchall()
     jobs = _mosaic([dict(r) for r in rows], limit=4000)
     scored = [j for j in jobs if j["score"] is not None]
     threshold = c.get("llm", {}).get("min_score", 6)
+    # Companies tile: boards read successfully out of every readable company,
+    # so the job count next to it is not mistaken for the crawl's reach.
+    listed = {e["name"] for e in c.get("companies", [])}
+    read = listed & set(s.board_ages())
     return {
         "jobs": jobs,
         "companies": [e["name"] for e in c.get("companies", [])],
+        "crawls": s.recent_crawls(8),
         "stats": {
+            "crawled": len(read),
+            "listed": len(listed),
             "checked": len(scored),
             "total": len(jobs),
             "closed": s.db.execute(
@@ -224,82 +375,108 @@ def _scan_events(limit: int, full: bool = False):
         # sqlite3 connections are bound to the thread that created them, so the
         # worker opens its own rather than borrowing the request thread's.
         s = store()
+        crawl = None
         try:
-            all_jobs, healthy, counts = [], [], {}
             # Same rules as cmd_scan: skip boards read within refresh_hours.
             fresh = set() if full else s.fresh_boards(float(c.get("refresh_hours", 0) or 0))
-            entries = [e for e in c.get("companies", []) if e["name"] not in fresh]
-            # Fetch boards in parallel; tiles still light up in config order.
-            with ThreadPoolExecutor(max_workers=int(c.get("fetch_concurrency", 10))) as pool:
-                for entry, (jobs, err) in zip(entries, pool.map(sources.fetch_company, entries)):
-                    if not err:
-                        healthy.append(entry["name"])
-                        counts[entry["name"]] = len(jobs)
-                        all_jobs.extend(jobs)
-                    emit("fetch", company=entry["name"], count=len(jobs), error=err or "")
-            disc = c.get("discovery", {})
-            if disc.get("enabled"):
-                jobs, _ = sources.discover(disc.get("queries", []), disc.get("max_per_query", 40))
-                all_jobs.extend(jobs)
-                emit("fetch", company="discovery", count=len(jobs), error="")
-
-            kept = [j for j in all_jobs if passes_filters(j, c.get("filters", {}))]
-            desc = {j["id"]: j["description"] for j in kept}
-            new = s.upsert(kept)
-            closed = s.mark_closed(healthy)
-            for name in healthy:
-                s.mark_fetched(name, counts[name])
-            s.link_applications()
-            emit("fetched", new=len(new), closed=len(closed), total=len(kept),
-                 skipped=len(fresh))
-
-            if c.get("llm", {}).get("provider", "none") == "none":
-                emit("done", scored=0, elapsed=round(time.time() - started, 1))
-                return
-
-            scorer = get_scorer(c)
-            prof = get_profile(c, scorer)
-            rows = s.unscored(limit)
-            emit("scoring", count=len(rows), backlog=s.unscored_count())
-
-            # A batched backend (Cursor) judges many postings per agent run, so
-            # chunk; a per-job backend gets chunks of one and behaves as before.
-            batched = hasattr(scorer, "score_batch")
-            size = int(c.get("llm", {}).get("batch_size", getattr(scorer, "batch_size", 25)))
-            chunks = ([rows[i:i + size] for i in range(0, len(rows), size)]
-                      if batched else [[r] for r in rows])
-
+            entries = boards_due(c, s, fresh, full)
+            crawl = start_crawl(c, s, "web", fresh, entries)
+            checked = 0
+            # One click walks every company in batches (scan_batch, default 50):
+            # each batch is fetched, filtered, saved and scored before the next
+            # starts on its own, so results show up batch by batch.
+            size = int(c.get("scan_batch", 50) or 50)
+            batches = [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
+            scoring = c.get("llm", {}).get("provider", "none") != "none"
+            scorer = prof = None
             done = 0
-            for chunk in chunks:
-                payload = []
-                for row in chunk:
-                    job = dict(row)
-                    job["description"] = desc.get(row["id"]) or row["description"] or ""
-                    payload.append(job)
-                emit("looking", id=chunk[0]["id"], company=chunk[0]["company"],
-                     title=(f"scoring {len(chunk)} jobs" if len(chunk) > 1
-                            else chunk[0]["title"]),
-                     domain=chunk[0]["domain"] or "")
-                try:
-                    if batched:
-                        results = scorer.score_batch(prof, payload)
-                    else:
-                        results = {chunk[0]["id"]: scorer.score(prof, payload[0])}
-                except (RateLimited, CursorError) as e:
-                    emit("throttled", message=str(e), scored=done)
-                    break
-                for row in chunk:
-                    score, reason, breakdown = results.get(row["id"], (0, "no result", {}))
-                    s.save_score(row["id"], score, reason, breakdown)
-                    done += 1
-                    emit("scored", id=row["id"], score=score, reason=reason,
-                         breakdown=breakdown, company=row["company"], title=row["title"],
-                         domain=row["domain"] or "", url=row["url"] or "")
+            for k, chunk in enumerate(batches, 1):
+                first = (k - 1) * size + 1
+                emit("batch", index=k, count=len(batches), companies=len(chunk),
+                     first=first, last=first + len(chunk) - 1, total=len(entries))
+                all_jobs, healthy, counts = [], [], {}
+                with ThreadPoolExecutor(max_workers=int(c.get("fetch_concurrency", 10))) as pool:
+                    for entry, (jobs, err) in zip(chunk, pool.map(sources.fetch_company, chunk)):
+                        if not err:
+                            healthy.append(entry["name"])
+                            counts[entry["name"]] = len(jobs)
+                            all_jobs.extend(jobs)
+                        emit("fetch", company=entry["name"], count=len(jobs), error=err or "")
+                disc = c.get("discovery", {})
+                if k == 1 and disc.get("enabled"):
+                    jobs, _ = sources.discover(disc.get("queries", []), disc.get("max_per_query", 40))
+                    all_jobs.extend(jobs)
+                    emit("fetch", company="discovery", count=len(jobs), error="")
+
+                kept = select_jobs(all_jobs, c, s)
+                desc = {j["id"]: j["description"] for j in kept}
+                new = s.upsert(kept)
+                closed = s.mark_closed(healthy)
+                for name in healthy:
+                    s.mark_fetched(name, counts[name])
+                s.link_applications()
+                s.add_to_crawl(crawl, ok=len(healthy), failed=len(chunk) - len(healthy),
+                               new_jobs=len(new), closed_jobs=len(closed))
+                checked += len(chunk)
+                emit("fetched", new=len(new), closed=len(closed), total=len(kept),
+                     skipped=len(fresh), batch=k, batches=len(batches),
+                     checked=checked, due=len(entries))
+
+                if not scoring:
+                    continue
+                if scorer is None:
+                    scorer = get_scorer(c)
+                    prof = get_profile(c, scorer)
+                rows = s.unscored(limit)
+                emit("scoring", count=len(rows), backlog=s.unscored_count(), batch=k,
+                     batches=len(batches))
+
+                # A batched backend (Cursor) judges many postings per agent run, so
+                # chunk; a per-job backend gets chunks of one and behaves as before.
+                batched = hasattr(scorer, "score_batch")
+                per = int(c.get("llm", {}).get("batch_size", getattr(scorer, "batch_size", 25)))
+                chunks = ([rows[i:i + per] for i in range(0, len(rows), per)]
+                          if batched else [[r] for r in rows])
+                for group in chunks:
+                    payload = []
+                    for row in group:
+                        job = dict(row)
+                        job["description"] = desc.get(row["id"]) or row["description"] or ""
+                        payload.append(job)
+                    emit("looking", id=group[0]["id"], company=group[0]["company"],
+                         title=(f"scoring {len(group)} jobs" if len(group) > 1
+                                else group[0]["title"]),
+                         domain=group[0]["domain"] or "")
+                    try:
+                        if batched:
+                            results = scorer.score_batch(prof, payload)
+                        else:
+                            results = {group[0]["id"]: scorer.score(prof, payload[0])}
+                    except (RateLimited, CursorError) as e:
+                        # Out of quota: keep fetching the remaining batches so
+                        # every job is found; they get scored on a later run.
+                        emit("throttled", message=str(e), scored=done)
+                        scoring = False
+                        break
+                    for row in group:
+                        if row["id"] not in results:
+                            continue            # dropped by the model: retried next run
+                        score, reason, breakdown = results[row["id"]]
+                        # Same code-enforced gates as the CLI scan.
+                        score, reason = apply_cap(score, row["title"], reason)
+                        score, reason = apply_relevance_cap(score, breakdown, reason)
+                        s.save_score(row["id"], score, reason, breakdown)
+                        done += 1
+                        emit("scored", id=row["id"], score=score, reason=reason,
+                             breakdown=breakdown, company=row["company"], title=row["title"],
+                             domain=row["domain"] or "", url=row["url"] or "")
 
             emit("done", scored=done, elapsed=round(time.time() - started, 1))
         except Exception as e:  # noqa: BLE001 - always close the stream cleanly
             emit("error", message=f"{type(e).__name__}: {e}"[:300])
         finally:
+            if crawl is not None:
+                s.finish_crawl(crawl)
             with _lock:
                 _state["scanning"] = False
             q.put(None)

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apply Status</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◎</span><span class="brandname">Job Radar</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="label">In queue</div><div class="value" id="a-queue">0</div></div>
+    <div class="stat"><div class="label">Applied this run</div><div class="value" id="a-done">0</div></div>
+    <div class="stat"><div class="label">Needs you</div><div class="value" id="a-needs">0</div></div>
+    <div class="stat"><div class="label">Engine</div><div class="value ap-phase" id="a-phase">stopped</div></div>
+  </div>
+</header>
+
+<div class="titlerow">
+  <h1>Apply status</h1>
+  <div class="controls">
+    <button id="start" class="scanbtn" type="button">Start AI engine</button>
+    <button id="stop" class="navbtn" type="button" hidden>Stop after this job</button>
+    <a class="navbtn" href="/history">Job apply history</a>
+    <a class="navbtn" href="/">← Back to jobs</a>
+  </div>
+</div>
+
+<div class="ap-error" id="error" hidden></div>
+
+<main class="ap-main">
+  <!-- left: what the engine is doing right now -->
+  <section class="ap-live">
+    <div class="ap-current" id="current">
+      <div class="muted">The engine is stopped. Add jobs with “Add to apply queue” on the jobs page, then press Start.</div>
+    </div>
+
+    <div class="ap-wait" id="wait" hidden>
+      <div class="kicker" id="w-kind">Needs you</div>
+      <div class="ap-wmsg" id="w-msg"></div>
+      <div class="ap-wopts" id="w-opts"></div>
+      <input class="search ap-winput" id="w-input" autocomplete="off" hidden>
+      <div class="ap-learn" id="w-learn" hidden>
+        <div class="kicker"><span class="ap-rec"></span>Watching you - every step is learned</div>
+        <ul id="w-steps"></ul>
+      </div>
+      <div class="ap-wbtns">
+        <button class="scanbtn" id="w-go" type="button">Continue</button>
+        <button class="navbtn" id="w-skip" type="button">Skip this job</button>
+      </div>
+    </div>
+
+    <div class="ap-screen">
+      <img id="screen" alt="The engine's browser window, live">
+      <div class="ap-noscreen muted" id="noscreen">the browser view appears here while the engine runs</div>
+    </div>
+
+    <div class="kicker sec">Steps</div>
+    <ol class="ap-log" id="log"></ol>
+  </section>
+
+  <!-- right: the queue -->
+  <aside class="panel ap-side">
+    <div class="kicker">Apply queue</div>
+    <ul class="ap-queue" id="queue"><li class="muted">empty</li></ul>
+
+    <div class="kicker sec">Finished by the engine</div>
+    <ul class="ap-queue" id="done"><li class="muted">nothing yet</li></ul>
+  </aside>
+</main>
+
+<script src="/static/apply.js"></script>
+</body>
+</html>

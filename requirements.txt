@@ -9,3 +9,7 @@ uvicorn[standard]>=0.29
 
 # Only needed for `import-applied` on .xlsx files.
 openpyxl>=3.1
+
+# The AI apply engine (web UI: Apply status). After installing, once:
+#   python -m playwright install chromium
+playwright>=1.47

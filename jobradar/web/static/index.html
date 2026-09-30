@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Job Radar</title>
-<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="/static/styles.css?v=2">
 </head>
 <body>
 <header class="topbar">
@@ -12,7 +12,10 @@
     <span class="mark">◎</span><span class="brandname">Job Radar</span>
   </div>
   <div class="stats">
-    <div class="stat"><div class="label">Checked</div>
+    <div class="stat" title="Companies whose job board was read, out of every readable company in the DB">
+      <div class="label">Companies</div>
+      <div class="value"><span id="s-crawled">0</span><span class="of">/<span id="s-listed">0</span></span></div></div>
+    <div class="stat" title="Jobs scored, out of open jobs that passed the filters"><div class="label">Jobs checked</div>
       <div class="value"><span id="s-checked">0</span><span class="of">/<span id="s-total">0</span></span></div></div>
     <div class="stat"><div class="label">Would apply</div><div class="value" id="s-hire">0</div></div>
     <div class="stat"><div class="label">Avg. match</div><div class="value" id="s-avg">0.00</div></div>
@@ -34,17 +37,36 @@
       <option value="8">8+</option>
     </select>
     <select id="co" class="sel" title="Company"><option value="">all companies</option></select>
+    <select id="rolefilter" class="sel" title="Role">
+      <option value="">all roles</option>
+      <option>Backend</option>
+      <option>Full stack</option>
+      <option>Software engineer</option>
+      <option>Frontend</option>
+    </select>
     <select id="stfilter" class="sel" title="Application status">
       <option value="">any status</option>
       <option value="none">not applied yet</option>
+      <option value="queued">in apply queue</option>
+      <option value="failed">AI apply failed</option>
       <option value="in_process">in process</option>
       <option value="applied">applied</option>
+      <option value="ai_applied">AI apply done</option>
       <option value="any">all I've acted on</option>
     </select>
     <label class="chk"><input type="checkbox" id="newonly"> new this week</label>
+    <button id="queueshown" class="navbtn" type="button"
+            title="Add every job the filters show (not applied yet) to the AI apply queue">Queue shown</button>
+    <a class="navbtn" href="/apply" id="applylink">Apply status</a>
     <a class="navbtn" href="/history">Job apply history</a>
     <button id="scan" class="scanbtn">Scan</button>
   </div>
+</div>
+
+<div class="batchbar" id="batchbar" hidden>
+  <div class="bb-text"><b id="bb-label">Batch 1</b> <span id="bb-range"></span>
+    <span class="bb-kept" id="bb-kept"></span></div>
+  <div class="bb-track"><i id="bb-fill"></i></div>
 </div>
 
 <main>
@@ -58,6 +80,11 @@
   </section>
 
   <aside class="panel">
+    <div class="selcard">
+      <div class="kicker">Selected job</div>
+      <div class="seljob" id="seljob"><div class="muted">click a tile to see the job and set its status</div></div>
+    </div>
+
     <div class="row">
       <div class="profile">
         <div class="avatar" id="avatar">?</div>
@@ -76,14 +103,23 @@
       </div>
     </div>
 
-    <div class="kicker sec">Selected job</div>
-    <div class="seljob" id="seljob"><div class="muted">click a tile to see the job and set its status</div></div>
+    <div class="kicker sec">Your skills <span class="muted">· most done first</span></div>
+    <div class="skills" id="skills"><span class="muted">reading your resume…</span></div>
+    <div class="skillkey muted">
+      <i class="sk top"></i>your 10/10 · <i class="sk good"></i>your 8/10 · <i class="sk strong"></i>used at work · <i class="sk working"></i>in a project ·
+      <i class="sk listed"></i>only listed</div>
+
+    <div class="kicker sec">Build next</div>
+    <div class="workon" id="workon"></div>
 
     <div class="kicker sec">Experience</div>
     <ul class="exp" id="exp"><li class="muted">loading…</li></ul>
 
     <div class="kicker sec">Checking</div>
     <ul class="checks" id="checks"></ul>
+
+    <div class="kicker sec">Recent crawls</div>
+    <ul class="crawls" id="crawls"><li class="muted">no crawl recorded yet</li></ul>
 
     <div class="kicker sec">High probability of interviewing</div>
     <div class="tops" id="tops"><div class="muted">nothing scored yet</div></div>

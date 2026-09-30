@@ -24,11 +24,12 @@ from . import sources
 from .budget import Budget
 from .cursor import CursorError
 from .llm import RateLimited, make_scorer
-from .experience import too_senior
+from .experience import experience_label, too_senior
 from .localmatch import LocalScorer
 from .resume import build_profile, extract_text
 from .relevance import apply_cap as apply_relevance_cap
-from .seniority import apply_cap
+from .roles import classify
+from .seniority import apply_cap, is_senior
 from .store import Store
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,7 +39,27 @@ PROFILE_CACHE = ROOT / ".resume_profile.json"
 def load_config(path: Path) -> dict:
     if not path.exists():
         sys.exit(f"No config at {path}. Copy config.example.yaml to config.yaml and edit it.")
-    return yaml.safe_load(path.read_text())
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    # The company list lives in the `companies` table of jobradar.db (see
+    # companies.py); companies.json is its readable export. Entries written in
+    # config.yaml itself still work and come first. On first run the table is
+    # seeded from companies_file, so an existing JSON list is picked up.
+    from .companies import config_companies, import_file
+    store = Store(path.parent / "jobradar.db")
+    seed = cfg.get("companies_file")
+    if seed and not store.companies():
+        jpath = Path(seed) if Path(seed).is_absolute() else path.parent / seed
+        if jpath.exists():
+            import_file(jpath, store)
+    listed = cfg.get("companies") or []
+    names = {c["name"].lower() for c in listed}
+    for c in config_companies(store):          # enabled, readable boards only
+        if c["name"].lower() not in names:
+            listed.append(c)
+            names.add(c["name"].lower())
+    cfg["companies"] = listed
+    store.db.close()
+    return cfg
 
 
 def get_scorer(cfg: dict):
@@ -87,9 +108,47 @@ def _resume_profile(cfg: dict, scorer, force: bool = False) -> str:
     return profile
 
 
-def passes_filters(job: dict, f: dict) -> bool:
+def select_jobs(all_jobs: list[dict], cfg: dict, store: Store) -> list[dict]:
+    """Apply the filters, reading full descriptions where a board lists none.
+
+    Cheap checks (title, location) run first. Then every NEW survivor whose
+    board gave no description - Workday and Oracle list endpoints never do -
+    has its detail page read, so the experience gate sees "3+ years" instead
+    of nothing. Jobs already stored were vetted when first seen, so a repeat
+    run only pays for postings that are actually new."""
+    f = cfg.get("filters", {})
+    cheap = [j for j in all_jobs if passes_filters(j, f, check_experience=False)]
+    if f.get("max_required_years") is not None:
+        known = store.known_ids()
+        need = [j for j in cheap if j["id"] not in known and j.get("source") in sources.DETAILS
+                and len(j.get("description") or "") < 300]
+        if need:
+            with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
+                for job, text in zip(need, pool.map(sources.fetch_details, need)):
+                    if text:
+                        job["description"] = text
+    kept = [j for j in cheap if not too_senior(j, f.get("max_required_years"))]
+    for j in kept:
+        j["experience"] = experience_label(j["title"], j.get("description") or "")
+        j.update(classify(j["title"], f.get("roles")) or {})
+    return kept
+
+
+def is_blocked(company: str, blocked: list[str] | None) -> bool:
+    """Whole-word match, so "ibm" blocks "IBM India" but not "Ibmx Labs"."""
+    name = (company or "").lower()
+    return any(re.search(rf"(?<![a-z0-9]){re.escape(b.lower())}(?![a-z0-9])", name)
+               for b in blocked or [])
+
+
+def passes_filters(job: dict, f: dict, check_experience: bool = True) -> bool:
+    if is_blocked(job.get("company", ""), f.get("blocked_companies")):
+        return False
     title = job["title"].lower()
-    inc = [s.lower() for s in f.get("title_include") or []]
+    # Configured roles replace the plain title_include list.
+    if f.get("roles") and classify(job["title"], f["roles"]) is None:
+        return False
+    inc = [] if f.get("roles") else [s.lower() for s in f.get("title_include") or []]
     exc = [s.lower() for s in f.get("title_exclude") or []]
     locs = [s.lower() for s in f.get("locations") or []]
     if inc and not any(s in title for s in inc):
@@ -99,15 +158,78 @@ def passes_filters(job: dict, f: dict) -> bool:
     # Whole words: "india" must not match "Indianapolis" or "Indiana".
     if locs and not any(re.search(rf"\b{re.escape(s)}\b", job["location"].lower()) for s in locs):
         return False
+    # A senior title (Staff, Principal, VP, Lead...) is an experience bar too;
+    # seniority.is_senior matches whole words, so "VP-" and "Staff Software
+    # Engineer" are caught where the substring list above misses them.
+    # "Member of Technical Staff" is an entry title at many companies, not Staff.
+    plain_title = re.sub(r"member of technical staff", "", job["title"], flags=re.I)
+    if f.get("max_required_years") is not None and is_senior(plain_title):
+        return False
     # Read from the full fetched description, before the store trims it.
-    if too_senior(job, f.get("max_required_years")):
+    if check_experience and too_senior(job, f.get("max_required_years")):
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
 
-def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False) -> dict:
+def boards_due(cfg: dict, store: Store, fresh: set[str], full: bool = False) -> list[dict]:
+    """Boards to read this run: not fresh, stalest first, at most boards_per_run.
+    With a long company list this spreads the reading over several runs
+    instead of every board coming due in the same one."""
+    entries = [e for e in cfg.get("companies", [])
+               if e["name"] not in fresh and not is_blocked(e["name"], cfg.get("filters", {})
+                                                            .get("blocked_companies"))]
+    cap = int(cfg.get("boards_per_run", 0) or 0)
+    if full or not cap or len(entries) <= cap:
+        return entries
+    ages = store.board_ages()
+    return sorted(entries, key=lambda e: ages.get(e["name"], 0))[:cap]
+
+
+def start_crawl(cfg: dict, store: Store, source: str, fresh: set[str],
+                entries: list[dict]) -> int:
+    """Open this crawl's row in the crawl history the web UI shows."""
+    listed = {e["name"] for e in cfg.get("companies", [])}
+    return store.start_crawl(source, readable=len(listed), skipped=len(listed & fresh),
+                             due=len(entries))
+
+
+def cmd_scan_batched(cfg: dict, store: Store, size: int, full: bool = False,
+                     quiet: bool = False) -> dict:
+    """Scan in batches of `size` companies: each batch is fetched, filtered,
+    saved and scored before the next starts, so new jobs appear in the web UI
+    batch by batch instead of all at the end of a long scan."""
+    fresh = set() if full else store.fresh_boards(float(cfg.get("refresh_hours", 0) or 0))
+    entries = boards_due(cfg, store, fresh, full)
+    batches = [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
+    total = {"new": 0, "closed": 0, "errors": []}
+    crawl = start_crawl(cfg, store, "scan", fresh, entries)
+    try:
+        for k, chunk in enumerate(batches, 1):
+            if not quiet:
+                print(f"\n=== batch {k}/{len(batches)}: {len(chunk)} companies "
+                      f"({chunk[0]['name'] if chunk else '-'} ... "
+                      f"{chunk[-1]['name'] if chunk else '-'})", flush=True)
+            got = cmd_scan(cfg, store, quiet=quiet, full=full, entries=chunk,
+                           discovery=(k == 1), crawl_id=crawl)
+            for key in ("new", "closed"):
+                total[key] += got[key]
+            total["errors"] += got["errors"]
+    finally:
+        store.finish_crawl(crawl)
+    if not quiet:
+        print(f"\nall batches: {total['new']} new jobs, {total['closed']} closed, "
+              f"{len(total['errors'])} errors", flush=True)
+    return total
+
+
+def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False,
+             entries: list[dict] | None = None, discovery: bool = True,
+             crawl_id: int | None = None, source: str = "scan") -> dict:
+    """Read the due boards, save what passes the filters and score it. Called
+    without `entries` it is a whole crawl and records its own crawl row;
+    cmd_scan_batched passes each batch plus the crawl it belongs to."""
     all_jobs: list[dict] = []
     errors: list[str] = []
     healthy_companies: list[str] = []
@@ -115,8 +237,13 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False) -
     # A board read within refresh_hours is skipped: postings rarely change by
     # the hour, and skipping leaves its jobs untouched (a skipped board is not
     # "healthy" this run, so nothing of it is marked closed). --full reads all.
-    fresh = set() if full else store.fresh_boards(float(cfg.get("refresh_hours", 0) or 0))
-    entries = [e for e in cfg.get("companies", []) if e["name"] not in fresh]
+    fresh = set()
+    if entries is None:
+        fresh = set() if full else store.fresh_boards(float(cfg.get("refresh_hours", 0) or 0))
+        entries = boards_due(cfg, store, fresh, full)
+    own_crawl = crawl_id is None
+    if own_crawl:
+        crawl_id = start_crawl(cfg, store, source, fresh, entries)
     if fresh and not quiet:
         print(f"  skipping {len(fresh)} boards read in the last {cfg.get('refresh_hours')}h "
               f"(scan --full to read them anyway)", flush=True)
@@ -138,14 +265,14 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False) -
                   flush=True)
 
     disc = cfg.get("discovery", {})
-    if disc.get("enabled"):
+    if discovery and disc.get("enabled"):
         jobs, errs = sources.discover(disc.get("queries", []), disc.get("max_per_query", 40))
         all_jobs.extend(jobs)
         errors.extend(errs)
         if not quiet:
             print(f"  {'discovery':<20} {len(jobs):>4} found")
 
-    kept = [j for j in all_jobs if passes_filters(j, cfg.get("filters", {}))]
+    kept = select_jobs(all_jobs, cfg, store)
     # keep descriptions around for scoring, keyed by id
     desc = {j["id"]: j["description"] for j in kept}
 
@@ -154,6 +281,11 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False) -
     counts = {e["name"]: len(j) for e, (j, err) in zip(entries, fetched) if not err}
     for name in healthy_companies:
         store.mark_fetched(name, counts.get(name, 0))
+    store.add_to_crawl(crawl_id, ok=len(healthy_companies),
+                       failed=len(entries) - len(healthy_companies),
+                       new_jobs=len(new), closed_jobs=len(closed))
+    if own_crawl:
+        store.finish_crawl(crawl_id)
     # A job you applied to before Job Radar tracked it is recognised now.
     store.link_applications()
 
@@ -413,7 +545,7 @@ def cmd_alert(cfg: dict, store: Store, dry_run: bool) -> None:
     narrow = dict(cfg)
     narrow["companies"] = [e for e in cfg.get("companies", []) if e["name"] in watch]
     narrow["discovery"] = {"enabled": False}
-    cmd_scan(narrow, store, quiet=True)
+    cmd_scan(narrow, store, quiet=True, source="alert")
     baselined = store.baselined_companies()
     pending = store.unalerted()
     rows = alerts_mod.pick(pending, cfg, baselined)
@@ -481,6 +613,50 @@ def cmd_list(store: Store, days: int) -> None:
         print(f"[{s}] {r['title'][:60]:<60} {r['company'][:18]:<18} {r['url']}")
 
 
+def cmd_recheck(cfg: dict, store: Store) -> None:
+    """Re-apply the current filters to every open job, re-reading pages where
+    the board lists no description. For after a rule change: jobs that no
+    longer qualify are closed (hidden), the rest get a fresh experience label.
+    Local only - no tokens."""
+    f = cfg.get("filters", {})
+    rows = [dict(r) for r in store.db.execute("SELECT * FROM jobs WHERE closed_at IS NULL")]
+    need = [j for j in rows if j["source"] in sources.DETAILS]
+    with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
+        for job, text in zip(need, pool.map(sources.fetch_details, need)):
+            if text:
+                job["description"] = text
+    now = time.time()
+    closed = 0
+    for j in rows:
+        if passes_filters(j, f):
+            role = classify(j["title"], f.get("roles")) or {}
+            store.db.execute(
+                "UPDATE jobs SET experience = ?, role = ?, role_rank = ?, role_bonus = ? "
+                "WHERE id = ?",
+                (experience_label(j["title"], j["description"] or ""), role.get("role"),
+                 role.get("role_rank"), role.get("role_bonus", 0), j["id"]))
+        else:
+            store.db.execute("UPDATE jobs SET closed_at = ? WHERE id = ?", (now, j["id"]))
+            closed += 1
+    store.db.commit()
+    print(f"Rechecked {len(rows)} open jobs: {closed} no longer match and were hidden, "
+          f"{len(rows) - closed} kept.")
+
+
+def cmd_companies(store: Store) -> None:
+    from collections import Counter
+    rows = store.companies()
+    scanned = [c for c in rows if c["enabled"] and c["board"] != "other"]
+    print(f"{len(rows)} companies on file, {len(scanned)} scanned.")
+    print("  by board:  " + ", ".join(f"{b} {n}" for b, n in
+                                      Counter(c["board"] for c in rows).most_common()))
+    print("  by source: " + ", ".join(f"{s} {n}" for s, n in
+                                      Counter(c["source"] or "?" for c in rows).most_common()))
+    off = [c for c in rows if not c["enabled"] and c["board"] != "other"]
+    if off:
+        print(f"  {len(off)} on a readable board but disabled (board not found when checked)")
+
+
 def cmd_applied(store: Store, status: str = "") -> None:
     rows = [r for r in store.applications() if not status or r["status"] == status]
     if not rows:
@@ -499,9 +675,30 @@ def main(argv=None) -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     sc = sub.add_parser("scan")
     sc.add_argument("--full", action="store_true", help="read every board, even fresh ones")
+    sc.add_argument("--batch", type=int, default=0,
+                    help="scan N companies at a time; each batch is saved and scored before the next")
     ia = sub.add_parser("import-applied", help="import an .xlsx/.csv application tracker")
     ia.add_argument("path")
-    ap = sub.add_parser("applied", help="list your application history")
+    sub.add_parser("recheck", help="re-apply filters to stored jobs (no tokens)")
+    ic = sub.add_parser("import-companies",
+                        help="add companies from .json / .txt (Name|board|slug|url) / .xlsx")
+    ic.add_argument("path")
+    sub.add_parser("export-companies", help="write the company table to companies.json")
+    sub.add_parser("companies", help="summary of the company table")
+    sub.add_parser("skills", help="your resume skills, most done first, and what MERN / "
+                                  "Python jobs ask for that you should build next")
+    cc = sub.add_parser("check-companies",
+                        help="check every board once: India job counts, disable missing boards")
+    cc.add_argument("--new", action="store_true", help="only companies never checked")
+    fb = sub.add_parser("find-boards",
+                        help="find the job board of each company in a file (Name, Name|domain "
+                             "or Name|board|slug|url) and add it; --disabled re-finds boards "
+                             "that have gone")
+    fb.add_argument("path", nargs="?")
+    fb.add_argument("--disabled", action="store_true",
+                    help="search again for companies whose board is gone or unreadable")
+    fb.add_argument("--workers", type=int, default=24, help="companies searched at once")
+    ap =sub.add_parser("applied", help="list your application history")
     ap.add_argument("--status", default="", help="only this status, e.g. applied")
     d = sub.add_parser("digest"); d.add_argument("--days", type=int, default=7)
     d.add_argument("--new-only", action="store_true", help="email only new openings")
@@ -519,18 +716,59 @@ def main(argv=None) -> None:
     store = Store(ROOT / "jobradar.db")
 
     if args.cmd == "scan":
-        cmd_scan(cfg, store, full=args.full)
+        size = args.batch or int(cfg.get("scan_batch", 0) or 0)
+        if size:
+            cmd_scan_batched(cfg, store, size, full=args.full)
+        else:
+            cmd_scan(cfg, store, full=args.full)
     elif args.cmd == "import-applied":
         from .applied import import_file
         got = import_file(Path(args.path), store)
         print(f"Imported {got['added']} applications ({got['skipped']} already there) "
               f"from sheets: {', '.join(got['sheets']) or 'none with a Company column'}.")
+    elif args.cmd == "import-companies":
+        from .companies import import_file
+        got = import_file(Path(args.path), store)
+        n = store.export_companies(ROOT / "companies.json")
+        print(f"{got['added']} added, {got['updated']} updated, {got['unchanged']} unchanged. "
+              f"companies.json rewritten ({n} companies).")
+    elif args.cmd == "export-companies":
+        print(f"companies.json written ({store.export_companies(ROOT / 'companies.json')} companies).")
+    elif args.cmd == "companies":
+        cmd_companies(store)
+    elif args.cmd == "skills":
+        from .skill import print_report, report_for
+        print_report(report_for(ROOT, cfg, store))
+    elif args.cmd == "check-companies":
+        from .companies import check_all
+        got = check_all(store, workers=int(cfg.get("fetch_concurrency", 10)), only_unchecked=args.new)
+        n = store.export_companies(ROOT / "companies.json")
+        print(f"checked: {got['ok']} ok, {got['gone']} not found (disabled), "
+              f"{got['error']} unreachable (left as they were). companies.json rewritten ({n}).")
+        cmd_companies(store)
+    elif args.cmd == "find-boards":
+        from . import discover
+        if not args.path and not args.disabled:
+            p.error("find-boards needs a file or --disabled")
+        got = (discover.run_file(Path(args.path), store, args.workers) if args.path
+               else discover.run_disabled(store, args.workers))
+        missing = got.pop("missing")
+        if missing:
+            out = Path(args.path).with_suffix(".missing.txt") if args.path \
+                else ROOT / "refind.missing.txt"
+            out.write_text("\n".join(missing) + "\n", encoding="utf-8")
+            print(f"No readable board with India jobs for {len(missing)}; listed in {out}.")
+        n = store.export_companies(ROOT / "companies.json")
+        print(", ".join(f"{v} {k}" for k, v in got.items()) + f". companies.json rewritten ({n}).")
+        cmd_companies(store)
+    elif args.cmd == "recheck":
+        cmd_recheck(cfg, store)
     elif args.cmd == "applied":
         cmd_applied(store, args.status)
     elif args.cmd == "digest":
         cmd_digest(cfg, store, args.days, args.dry_run, args.new_only)
     elif args.cmd == "run":
-        cmd_scan(cfg, store)
+        cmd_scan(cfg, store, source="run")
         cmd_digest(cfg, store, args.days, args.dry_run, args.new_only)
     elif args.cmd == "list":
         cmd_list(store, args.days)

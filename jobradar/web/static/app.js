@@ -41,7 +41,8 @@ function makeTile(job) {
   const el = document.createElement("div");
   el.className = "tile " + bucket(job.score) + (selectedId === job.id ? " sel" : "");
   el.title = `${job.title} — ${job.company}` + (job.score !== null ? ` · ${job.score}/10` : "") +
-    (job.app_status ? ` · ${STATUS_LABEL[job.app_status] || job.app_status}` : "");
+    (job.app_status ? ` · ${STATUS_LABEL[job.app_status] || job.app_status}` : "") +
+    (job.role ? ` · ${job.role}` : "") + (job.experience ? ` · exp: ${job.experience}` : "");
   if (job.app_status && job.app_status !== "not_applied") el.dataset.st = job.app_status;
   attachLogo(el, job);
   el.onclick = () => selectJob(job);
@@ -51,8 +52,9 @@ function makeTile(job) {
 
 // --- application status ------------------------------------------------------
 const STATUS_LABEL = {
-  not_applied: "Not applied", in_process: "In process", referral: "Referral",
-  applied: "Applied", contacted: "Contacted", assessment: "Assessment",
+  not_applied: "Not applied", queued: "In apply queue", applying: "AI applying",
+  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process", referral: "Referral",
+  applied: "Applied", ai_applied: "AI apply done", contacted: "Contacted", assessment: "Assessment",
   interview: "Interview", offer: "Offer", rejected: "Rejected",
   expired: "Expired", withdrawn: "Withdrawn",
 };
@@ -86,7 +88,10 @@ function selectJob(job) {
   meta.textContent = [job.company, job.location,
     job.score !== null && job.score !== undefined ? `${job.score}/10` : "not scored yet"]
     .filter(Boolean).join(" · ");
-  box.append(title, meta);
+  const exp = document.createElement("div");
+  exp.className = "sj-meta";
+  exp.textContent = `Role: ${job.role || "—"} · Experience asked: ${job.experience || "not stated"}`;
+  box.append(title, meta, exp);
   if (job.reason) {
     const why = document.createElement("div");
     why.className = "sj-reason"; why.textContent = job.reason;
@@ -113,6 +118,27 @@ function selectJob(job) {
     }
   });
   actions.appendChild(sel);
+  const inQueue = ["queued", "applying", "needs_you"].includes(job.app_status);
+  const applied = job.app_status && !["not_applied", "failed"].includes(job.app_status) && !inQueue;
+  const q = document.createElement("button");
+  q.type = "button"; q.className = "sj-queue";
+  q.textContent = inQueue ? "In apply queue" : "Add to apply queue";
+  q.disabled = inQueue || applied;
+  q.title = applied ? "already applied" : "the AI engine will apply to it - see Apply status";
+  q.onclick = async () => {
+    q.disabled = true;
+    const d = await queueJobs([job.id]);
+    if (d.added.length) {
+      job.app_status = "queued"; sel.value = "queued";
+      q.textContent = "In apply queue";
+      saved.textContent = "added - open Apply status to start";
+      renderGrid();
+    } else {
+      q.disabled = false;
+      saved.textContent = `not queued: ${(d.refused[0] || {}).why || "refused"}`;
+    }
+  };
+  actions.appendChild(q);
   if (job.url) {
     const open = document.createElement("a");
     open.className = "sj-open"; open.href = job.url; open.target = "_blank"; open.rel = "noopener";
@@ -121,6 +147,33 @@ function selectJob(job) {
   }
   actions.appendChild(saved);
   box.appendChild(actions);
+}
+
+async function queueJobs(ids) {
+  const r = await fetch("/api/apply/queue", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_ids: ids }),
+  });
+  return r.ok ? r.json() : { added: [], refused: [{ why: `error ${r.status}` }] };
+}
+
+// Every job the filters show that has no application yet goes to the queue.
+async function queueShown() {
+  const f = currentFilter();
+  const ids = jobs.filter((j) => matches(j, f) && statusMatches(j, "none")).map((j) => j.id);
+  if (!ids.length) { alert("No unapplied jobs match the filters."); return; }
+  if (!confirm(`Add ${ids.length} job(s) to the AI apply queue?\n` +
+               "Jobs below your minimum match score are skipped.")) return;
+  const d = await queueJobs(ids);
+  const why = {};                 // "match 3/10 is below 5" x 12, not twelve lines
+  for (const x of d.refused) {
+    const k = x.why.replace(/[\d.]+\/10/, "N/10");
+    why[k] = (why[k] || 0) + 1;
+  }
+  alert(`${d.added.length} added to the apply queue.` +
+        (d.refused.length ? `\n${d.refused.length} not added:\n` +
+          Object.entries(why).map(([w, n]) => `  ${n} × ${w}`).join("\n") : ""));
+  await loadState();
 }
 
 function addInitial(el, company) {
@@ -140,6 +193,7 @@ function currentFilter() {
     company: $("co").value || "",
     newOnly: $("newonly").checked,
     status: $("stfilter").value || "",
+    role: $("rolefilter").value || "",
   };
 }
 
@@ -162,6 +216,7 @@ function matches(job, f) {
   if (f.newOnly && (!job.first_seen || Date.now() / 1000 - job.first_seen > WEEK)) return false;
   if (f.q && searchIds && !searchIds.has(job.id)) return false;
   if (!statusMatches(job, f.status)) return false;
+  if (f.role && job.role !== f.role) return false;
   return true;
 }
 
@@ -191,7 +246,7 @@ function renderGrid() {
     grid.appendChild(el);
     shown++;
   }
-  const filtered = f.q || f.min || f.company || f.newOnly || f.status;
+  const filtered = f.q || f.min || f.company || f.newOnly || f.status || f.role;
   if (!jobs.length) {
     $("gridnote").textContent = "no jobs yet — press Scan";
   } else if (!shown) {
@@ -232,11 +287,44 @@ function renderStats(s) {
   $("s-total").textContent = s.total;
   $("s-hire").textContent = s.would_hire;
   $("s-avg").textContent = Number(s.avg).toFixed(2);
+  // Only /api/state sends the company counts; scoring updates leave them be.
+  if (s.crawled !== undefined) {
+    $("s-crawled").textContent = s.crawled;
+    $("s-listed").textContent = s.listed;
+  }
+}
+
+// One line per crawl from the DB: how many companies it read out of all on
+// file, and why the rest were not read (fresh, or no readable board).
+function renderCrawls(rows) {
+  const ul = $("crawls");
+  if (!rows.length) { ul.innerHTML = `<li class="muted">no crawl recorded yet</li>`; return; }
+  ul.innerHTML = rows.map((c) => {
+    const when = new Date(c.started_at * 1000).toLocaleString([], {
+      day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    const checked = c.ok + c.failed;
+    const running = c.finished_at ? "" : ` <span class="cr-live">running</span>`;
+    const detail = [
+      `${c.ok} ok`, c.failed ? `${c.failed} failed` : "",
+      c.skipped ? `${c.skipped} skipped (read recently)` : "",
+      c.in_db - c.readable > 0 ? `${c.in_db - c.readable} no readable board` : "",
+      `${c.new_jobs} new jobs`,
+    ].filter(Boolean).join(" · ");
+    return `<li><div><b>${checked}</b> of ${c.in_db} companies checked${running}
+      <span class="muted">· ${escapeHtml(c.source)} · ${when}</span></div>
+      <div class="muted">${detail}</div></li>`;
+  }).join("");
+}
+
+// Lists sort by score plus the role's bonus (frontend -1), then role priority.
+function rankCmp(a, b) {
+  return (b.score + (b.role_bonus || 0)) - (a.score + (a.role_bonus || 0)) ||
+         (a.role_rank || 9) - (b.role_rank || 9);
 }
 
 function renderTops() {
   const scored = jobs.filter((j) => j.score !== null && j.score !== undefined);
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort(rankCmp);
   const top = scored.slice(0, 5);
   const box = $("tops");
   box.textContent = "";
@@ -294,14 +382,33 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+let watching = false;      // true while this tab has the live scan stream open
+let pollTimer = null;
+
 async function loadState() {
   const r = await fetch("/api/state");
   const d = await r.json();
   jobs = d.jobs;
   scoringOn = d.scoring !== false;
   fillCompanies();
-  renderGrid(); renderStats(d.stats); renderTops();
-  renderChecks(jobs.find((j) => j.score !== null) || null);
+  renderGrid(); renderStats(d.stats); renderTops(); renderCrawls(d.crawls || []);
+  if (!selectedId) renderChecks(jobs.find((j) => j.score !== null) || null);
+  // A scan started elsewhere (another tab, the scheduler, before a reload):
+  // no live stream here, so refresh every 15s until it finishes. Each refresh
+  // adds that batch's jobs to the grid; nothing already shown is removed.
+  clearTimeout(pollTimer);
+  if (d.scanning && !watching) {
+    $("batchbar").hidden = false;
+    $("bb-label").textContent = "Scan running";
+    $("bb-range").textContent = "· new jobs appear here batch by batch";
+    $("bb-kept").textContent = `${jobs.length} jobs so far`;
+    $("scan").disabled = true; $("scan").textContent = "Scanning…";
+    pollTimer = setTimeout(loadState, 15000);
+  } else if (!watching && $("scan").disabled) {
+    $("scan").disabled = false; $("scan").textContent = "Scan";
+    $("bb-label").textContent = "Scan complete";
+    $("bb-range").textContent = "";
+  }
 }
 
 async function loadProfile() {
@@ -328,7 +435,31 @@ async function loadProfile() {
   }
 }
 
+// Resume skills, most done first (skill.py), then per track what the collected
+// jobs ask for that the resume only lists or lacks.
+async function loadSkills() {
+  const d = await fetch("/api/skills").then((r) => r.json());
+  const box = $("skills");
+  if (!(d.skills || []).length) {
+    box.innerHTML = `<span class="muted">${escapeHtml(d.error || "no skills found on the resume")}</span>`;
+    return;
+  }
+  box.innerHTML = d.skills.map((s) =>
+    `<span class="sk ${s.tier}" title="${escapeHtml(s.category)} · work ${s.work} · projects ${s.projects}` +
+    `${s.listed ? " · listed" : ""} · ${s.rating ? `your rating ${s.rating}/10` : `score ${s.score}`}">${escapeHtml(s.name)}</span>`).join("");
+  $("workon").innerHTML = (d.tracks || []).map((t) => {
+    const items = t.work_on.length
+      ? t.work_on.map((a) => `<span class="sk ${a.yours}" title="asked by ${Math.round(a.share * 100)}% of ` +
+          `these jobs; on your resume: ${a.yours}">${escapeHtml(a.name)} ` +
+          `<b>${Math.round(a.share * 100)}%</b></span>`).join("")
+      : `<span class="muted">${t.jobs ? "you cover what these jobs ask" : "no jobs of this kind collected yet"}</span>`;
+    return `<div class="track"><div class="tr-head">${escapeHtml(t.label)}
+      <span class="muted">· ${t.jobs} jobs</span></div><div class="skills">${items}</div></div>`;
+  }).join("");
+}
+
 let lit = [];
+let batchNew = 0;         // new jobs added across the batches of the current scan
 function clearLit() {
   for (const el of lit) el.classList.remove("active");
   lit = [];
@@ -357,7 +488,10 @@ function startScan() {
     $("s-time").textContent = ((Date.now() - t0) / 1000).toFixed(1);
   }, 100);
 
+  watching = true;
   const es = new EventSource("/api/scan?limit=3000");
+  batchNew = 0;
+  $("bb-kept").textContent = "";
   let active = null;
 
   es.onmessage = (ev) => {
@@ -369,11 +503,31 @@ function startScan() {
       // Fetching is the long half of a scan. Light up that company's tiles so
       // the grid shows progress instead of sitting still for two minutes.
       highlightCompany(d.company);
+    } else if (d.type === "batch") {
+      // One click walks every company, a batch at a time. Jobs from earlier
+      // batches (and earlier scans) stay on the grid; each batch adds to them.
+      const first = d.first ?? (d.index - 1) * 50 + 1;
+      const last = d.last ?? first + d.companies - 1;
+      $("batchbar").hidden = false;
+      $("bb-label").textContent = `Batch ${d.index} of ${d.count}`;
+      $("bb-range").textContent = `· companies ${first}–${last}` + (d.total ? ` of ${d.total}` : "");
+      $("bb-fill").style.width = `${Math.round(((d.index - 1) / d.count) * 100)}%`;
+      $("lk-company").textContent = `batch ${d.index} of ${d.count}`;
+      $("lk-title").textContent = `companies ${first}–${last}`;
+      $("scan").textContent = `Scanning ${d.index}/${d.count}…`;
     } else if (d.type === "fetched") {
       loadState();
-      $("gridnote").textContent = `${d.new} new · ${d.closed} closed · ${d.total} tracked`;
+      const where = d.batches > 1 ? `batch ${d.batch}/${d.batches}: ` : "";
+      $("gridnote").textContent = `${where}${d.new} new · ${d.closed} closed · ${d.total} kept`;
+      if (d.batches) {
+        $("bb-fill").style.width = `${Math.round((d.batch / d.batches) * 100)}%`;
+      }
+      batchNew += d.new || 0;
+      $("bb-kept").textContent = `${batchNew} new jobs added this scan` +
+        (d.due !== undefined ? ` · ${d.checked} of ${d.due} companies checked` : "");
     } else if (d.type === "scoring") {
-      $("gridnote").textContent = `scoring ${d.count} of ${d.backlog} unscored`;
+      const where = d.batches > 1 ? `batch ${d.batch}/${d.batches}: ` : "";
+      $("gridnote").textContent = `${where}scoring ${d.count} of ${d.backlog} unscored`;
     } else if (d.type === "looking") {
       clearLit();
       active = tiles.get(d.id) || null;
@@ -413,22 +567,25 @@ function startScan() {
       $("s-time").textContent = d.elapsed.toFixed(1);
       $("lk-company").textContent = "idle"; $("lk-title").textContent = ""; $("lk-score").textContent = "";
       clearLit();
-      es.close(); clearInterval(timer);
+      es.close(); clearInterval(timer); watching = false;
       btn.disabled = false; btn.textContent = "Scan";
+      $("bb-label").textContent = "Scan complete";
+      $("bb-fill").style.width = "100%";
       loadState();
     }
   };
   es.onerror = () => {
     clearLit();
-    es.close(); clearInterval(timer);
+    es.close(); clearInterval(timer); watching = false;
     btn.disabled = false; btn.textContent = "Scan";
+    loadState();
   };
 }
 
 function showMatchMade() {
   const scored = jobs.filter((j) => j.score !== null && j.score !== undefined);
   if (!scored.length) return;
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort(rankCmp);
   const top = scored.slice(0, 5);
 
   const name = $("p-name").textContent;
@@ -471,13 +628,16 @@ function showMatchMade() {
 }
 
 $("scan").onclick = startScan;
+$("queueshown").onclick = queueShown;
 $("q").addEventListener("input", onFilterChange);
 $("minscore").addEventListener("change", renderGrid);
 $("co").addEventListener("change", renderGrid);
 $("newonly").addEventListener("change", renderGrid);
 $("stfilter").addEventListener("change", renderGrid);
+$("rolefilter").addEventListener("change", renderGrid);
 $("q").addEventListener("keydown", (e) => {
   if (e.key === "Escape") { $("q").value = ""; searchIds = null; renderGrid(); }
 });
 loadProfile();
+loadSkills();
 loadState();

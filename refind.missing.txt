@@ -1,0 +1,253 @@
+A2D Innovations
+ADP
+AMD
+ASSA ABLOY Group
+Acko
+Akamai
+Amagi
+Angel One
+Ansys
+Anthology
+Anysphere (Cursor)
+Applied Intuition
+Arista Networks
+Athena health
+Atlassian
+Axelerant
+BNY
+Beebom
+Benchmark Gensuite
+Bentley Systems
+Best Buy
+BetaNXT
+BharatPe
+Blackhawk Network India
+Boomi
+Bosch Global Software
+Bounce
+Bread financial
+Bumble
+CBTS serves enterprise
+Capillary Technologies
+Cargill
+Carrier
+Cashfree Payments
+Cencora
+Chargebee
+Clari
+Clarisights
+Cleartax
+CleverTap
+CoinDCX
+CoinSwitch
+Cornerstone
+Creuto
+Cuemath
+Cult.fit
+Cumulations Technologies
+DHL
+Dayforce
+DealShare
+Deloitte
+Dexcom
+Docusign
+Dream Sports (FanCode)
+Dream11
+Dunzo
+Dzylo
+Eightfold AI
+Epiroc
+Ericsson
+Eruditus
+Eshopbox
+Etsy
+Eventbrite
+Exotel
+Expedia Group
+FICO
+FanCode
+Games24x7
+Global logic
+Gojek
+Grammarly
+Halliburton
+HashiCorp
+Hasura
+Heizen
+Hitachi Vantara
+Honeywell
+INDmoney
+Icertis
+Ikigai Infotech LLP
+InCred
+Infor
+Innovaccer
+Iris
+Jar
+Junglee Games
+Juniper Networks
+Juspay
+Keysight
+Khatabook
+Kredivo
+Krutrim
+Kuvera
+Lam Research
+Landis+Gyr
+Lattice
+LeadSquared
+Lenskart
+Livspace
+Lowe’s
+M2P Fintech
+MSCI
+Magna
+Makunai Global
+Medallia
+Medpace
+MetLife
+Milliman
+Miro
+Mobile Premier League
+Moglix
+Moody's
+Nagarro
+Navi
+Nazara Technologies
+NetApp
+Netflix
+Newton School
+Nomura
+Nutanix
+OfBusiness
+Ola Electric
+Open Financial
+OpenText
+Opendoor
+Optum
+Park+
+Perplexity
+PharmEasy
+PhonePe
+Physics Wallah
+Pidility
+Plaid
+Postman
+Postman Labs Sample
+Principal Financial Services, Inc
+Procore
+Qlik
+Qualcomm
+Quest Global
+Quora
+Rakuten
+Rapid7
+Rapido
+Retool
+Rippling
+Rocketlane
+Rws
+SHL
+SLB
+SandDisk
+Scaler
+Schneider Electric
+Scribd
+Seagate
+Seismic
+SentinelOne
+Sentry
+ServiceNow
+Setu
+ShareChat
+Sherweblife
+Shiprocket
+Simplilearn
+Skyworks
+Slack Tech Sample
+Slice
+Snapmint,SDE I - Backend,,https://www.instahyre.com/job-371492-sde-i-backend-at-snapmint-gurgaon/,,ATS 88% | 1-3 yrs | Node.js + MongoDB + PostgreSQL | Gurgaon | fintech
+Snyk
+Société Générale
+Softkode Technologies
+Sourcegraph
+Sovos
+Spinny
+Splunk
+Spotnana
+Sprinklr
+Sprinto
+Standard Chartered
+Statsig
+StoneX
+Swiggy
+Synopsys
+Sysco Labs
+Tenable
+Teradata
+Tesco
+Tessell
+Testbook
+Texas Instruments
+Thermo fisher
+ThoughtSpot
+Thumbtack
+Toplyne
+TraceLink
+TransPerfect
+TravClan
+Trimble
+UKG
+Uber
+Udaan Hotels & Resorts
+Uniphore
+Uniphore Labs
+Unity
+Unity Software
+Urban Company
+VMware
+Vahan
+Verisk
+Veritas
+Vimeo
+Vymo
+Walmart Global Tech
+Wayfair
+Weights & Biases
+Western Digital
+Whatfix
+WinZO
+Windsurf
+Wingify
+Workday Rising Sample
+Xoxoday
+Xpressbees
+Yellow.ai
+Yubi
+Zebra Technologies
+Zendesk
+Zeno Health
+Zeta Suite
+Zetwerk
+Zillow
+Zoho Corp
+Zoho Recruit Sample Co
+Zolve
+Zynga
+auric-ai
+bookmyshow
+clarivate
+cyient
+futops
+inspironlabs
+keywordio
+kiprosh
+myKaarma
+otis
+persol
+smallcase
+tecalliance
+upGrad
+wex
+zenvior
+zithara Ai

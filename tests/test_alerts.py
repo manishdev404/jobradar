@@ -47,7 +47,7 @@ print("alert tests PASS")
 # --- the daily alert must not re-scan the whole board ----------------------
 import jobradar.main as M
 seen = {}
-def fake_scan(cfg, store, quiet=False):
+def fake_scan(cfg, store, quiet=False, **_):
     seen["companies"] = [e["name"] for e in cfg.get("companies", [])]
     seen["discovery"] = cfg.get("discovery", {}).get("enabled")
     return {"new": 0, "closed": 0, "errors": []}

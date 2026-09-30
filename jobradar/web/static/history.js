@@ -1,13 +1,14 @@
 const $ = (id) => document.getElementById(id);
 
 const STATUS_LABEL = {
-  not_applied: "Not applied", in_process: "In process", referral: "Referral",
-  applied: "Applied", contacted: "Contacted", assessment: "Assessment",
+  not_applied: "Not applied", queued: "In apply queue", applying: "AI applying",
+  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process", referral: "Referral",
+  applied: "Applied", ai_applied: "AI apply done", contacted: "Contacted", assessment: "Assessment",
   interview: "Interview", offer: "Offer", rejected: "Rejected",
   expired: "Expired", withdrawn: "Withdrawn",
 };
 // Counted as "applied" in the header: anything past the decision to apply.
-const APPLIED = new Set(["referral", "applied", "contacted", "assessment", "interview",
+const APPLIED = new Set(["referral", "applied", "ai_applied", "contacted", "assessment", "interview",
                          "offer", "rejected", "expired", "withdrawn"]);
 
 let apps = [];
@@ -85,7 +86,7 @@ function render() {
   tbody.textContent = "";
   const shown = apps.filter((a) => matches(a, q));
   if (!shown.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="empty">${
+    tbody.innerHTML = `<tr><td colspan="9" class="empty">${
       apps.length ? "Nothing matches." :
       "No history yet. Set a status on a job, or import your tracker: ./run.sh import-applied private/JOB\\ APPLY.xlsx"
     }</td></tr>`;
@@ -142,6 +143,26 @@ function row(a) {
     }
   }));
 
+  // Who sent it: the AI engine (with the resume it chose and a screenshot of
+  // the submitted page), the engine with a step done by you, or you.
+  const by = cell(tr);
+  if (a.applied_by) {
+    by.innerHTML = `<div class="by ai">${a.applied_by === "ai_assisted" ? "AI engine + you" : "AI engine"}</div>`;
+    const sub = document.createElement("div");
+    sub.className = "sub";
+    sub.textContent = a.resume || "";
+    if (a.proof) {
+      const link = document.createElement("a");
+      link.href = `/api/apply/proof/${a.id}`; link.target = "_blank"; link.textContent = " · screenshot";
+      sub.appendChild(link);
+    }
+    by.appendChild(sub);
+  } else if (["queued", "applying", "needs_you"].includes(a.status)) {
+    by.innerHTML = `<a class="by" href="/apply">AI engine (queued)</a>`;
+  } else {
+    by.innerHTML = `<span class="by muted">${APPLIED.has(a.status) ? "You" : "—"}</span>`;
+  }
+
   cell(tr, "num").textContent =
     a.score !== null && a.score !== undefined ? `${a.score}/10` : "—";
 
@@ -170,13 +191,16 @@ function row(a) {
 }
 
 function downloadCsv() {
-  const cols = ["applied_at", "company", "title", "location", "status", "experience", "skills",
-                "score", "url", "notes"];
+  const cols = ["applied_at", "company", "title", "location", "status", "applied_by", "resume",
+                "experience", "skills", "score", "url", "notes"];
   const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const lines = [cols.join(",")];
   for (const a of apps) {
     lines.push(cols.map((c) => esc(c === "applied_at" && a[c]
-      ? new Date(a[c] * 1000).toISOString().slice(0, 10) : a[c])).join(","));
+      ? new Date(a[c] * 1000).toISOString().slice(0, 10)
+      : c === "applied_by" ? ({ ai_engine: "AI engine", ai_assisted: "AI engine + you" }[a[c]] ||
+                              (APPLIED.has(a.status) ? "You" : ""))
+      : a[c])).join(","));
   }
   const blob = new Blob([lines.join("\n")], { type: "text/csv" });
   const link = document.createElement("a");
