@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Job Radar</title>
-<link rel="stylesheet" href="/static/styles.css?v=2">
+<link rel="stylesheet" href="/static/styles.css?v=10">
 </head>
 <body>
 <header class="topbar">
@@ -12,9 +12,9 @@
     <span class="mark">◎</span><span class="brandname">Job Radar</span>
   </div>
   <div class="stats">
-    <div class="stat" title="Companies whose job board was read, out of every readable company in the DB">
+    <div class="stat" id="s-companies" title="Companies scanned, out of every company in the DB">
       <div class="label">Companies</div>
-      <div class="value"><span id="s-crawled">0</span><span class="of">/<span id="s-listed">0</span></span></div></div>
+      <div class="value"><span id="s-crawled">0</span><span class="of">/<span id="s-indb">0</span></span></div></div>
     <div class="stat" title="Jobs scored, out of open jobs that passed the filters"><div class="label">Jobs checked</div>
       <div class="value"><span id="s-checked">0</span><span class="of">/<span id="s-total">0</span></span></div></div>
     <div class="stat"><div class="label">Would apply</div><div class="value" id="s-hire">0</div></div>
@@ -25,7 +25,10 @@
 </header>
 
 <div class="titlerow">
-  <h1>Picking the best company for <span id="who">you</span></h1>
+  <div class="titlehead">
+    <h1>Picking the best company for <span id="who">you</span></h1>
+    <div id="stlegend" class="stlegend" title="What the dot on a job tile means, and how many jobs have it"></div>
+  </div>
   <div class="controls">
     <input id="q" class="search" type="search" autocomplete="off"
            placeholder="Search role or company — e.g. react, intern, Adobe">
@@ -47,20 +50,29 @@
     <select id="stfilter" class="sel" title="Application status">
       <option value="">any status</option>
       <option value="none">not applied yet</option>
-      <option value="queued">in apply queue</option>
-      <option value="failed">AI apply failed</option>
-      <option value="in_process">in process</option>
-      <option value="applied">applied</option>
-      <option value="ai_applied">AI apply done</option>
       <option value="any">all I've acted on</option>
+      <!-- one option per status, filled in by app.js from STATUS_LABEL -->
     </select>
     <label class="chk"><input type="checkbox" id="newonly"> new this week</label>
-    <button id="queueshown" class="navbtn" type="button"
-            title="Add every job the filters show (not applied yet) to the AI apply queue">Queue shown</button>
-    <a class="navbtn" href="/apply" id="applylink">Apply status</a>
+    <a class="navbtn" href="/apply" id="applylink" title="Opens the job queue on the right half of the screen and the AI's Chrome window on the left">Job apply queue</a>
     <a class="navbtn" href="/history">Job apply history</a>
-    <button id="scan" class="scanbtn">Scan</button>
   </div>
+</div>
+
+<!-- One time range for both: the jobs shown below, and what a Scan scores.
+     Locked while a scan runs, also after a reload, until it is done. -->
+<div class="scanrow">
+  <label for="posted" class="sr-label">Jobs posted in</label>
+  <select id="posted" class="sel"
+          title="When the job site says the job was posted. Jobs with no known date show only with 'any time'. Checked before every other filter, and a Scan scores only these.">
+    <option value="0">any time</option>
+    <option value="1">the last 24 hours</option>
+    <option value="3">the last 3 days</option>
+    <option value="7">the last 7 days</option>
+    <option value="30">the last 30 days</option>
+  </select>
+  <button id="scan" class="scanbtn">Scan</button>
+  <span id="scanstatus" class="sr-status" aria-live="polite"></span>
 </div>
 
 <div class="batchbar" id="batchbar" hidden>
@@ -126,6 +138,6 @@
   </aside>
 </main>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=21"></script>
 </body>
 </html>
