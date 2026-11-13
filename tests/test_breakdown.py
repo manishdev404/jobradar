@@ -71,6 +71,16 @@ except ValueError as e:
 # the prompt stays lean at a full batch
 p = batch.build_prompt("p" * 5000, [{**j, "description": "d" * 4000} for j in jobs3])
 assert len(p) < 1200 + 3 * 400 + 800, f"prompt ballooned to {len(p)}"
+
+# the model gets what a posting asks for, read from the full page, not its
+# company intro; a posting that names no skill sends its opening instead
+line = batch._job_lines([{"company": "Acme", "title": "Backend Engineer", "location": "Pune",
+                          "description": "<p>About Acme: we love our customers.</p><p>Requirements:"
+                                         " 3+ years of experience with Node.js, PostgreSQL and React.</p>"}])
+assert line == "0|Acme|Backend Engineer|Pune|3+ yrs|Node.js, PostgreSQL, React", line
+line = batch._job_lines([{"company": "Acme", "title": "Engineer", "location": "",
+                          "description": "We build | rockets."}])
+assert line == "0|Acme|Engineer|?|not stated|We build / rockets.", line
 print("batch parsing tests PASS")
 
 # --- a malformed reply must not cost the whole batch -----------------------

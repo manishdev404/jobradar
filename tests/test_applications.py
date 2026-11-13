@@ -51,14 +51,18 @@ assert required_years("x", "For over 20 years, Smartsheet has") is None
 assert required_years("x", "journey 9 years back") is None
 assert required_years("x", "Experience: 4-5 years\nBACKEND (Node.js)") == 4, "BACKEND is not 'years back'"
 # Zoho detail pages embed the record as a JS string: var jobs = JSON.parse('...')
-from jobradar import sources
+from jobradar import details, net
+from jobradar.experience import job_years
 _page = (r"<script>var jobs = JSON.parse('[{\x22Work_Experience\x22:\x224\-5 years\x22,"
          r"\x22Job_Description\x22:\x22<div>Years of Experience \\u2013 3+ years<\\\/div>\x22}]');</script>")
-_real_request, sources._request = sources._request, lambda *a, **k: type("R", (), {"text": _page})()
-_d = sources.fetch_details({"source": "zoho", "url": "https://x.zohorecruit.in/jobs/Careers/1/Y"})
-sources._request = _real_request
-assert _d == "Experience: 4-5 years\n<div>Years of Experience – 3+ years</div>", _d
-assert required_years("Backend Developer", _d) == 4
+_real_page, net.page = net.page, lambda url, **k: (url, _page)
+_job = {"source": "zoho", "title": "Backend Developer", "url": "https://x.zohorecruit.in/jobs/Careers/1/Y"}
+_d = details.read(_job)
+net.page = _real_page
+assert _d.text == "Years of Experience – 3+ years", _d.text
+assert (_d.years_min, _d.years_max) == (4, 5), "the board's own Work_Experience field"
+details.apply(_job, _d)
+assert job_years(_job) == 4, "the board's field beats the 3+ in the text"
 assert required_years("x", "&lt;strong&gt;Experience:&lt;/strong&gt; 3–5 Years") == 3
 assert required_years("x", "1+ years of Python; 3+ years overall") == 3, "strictest requirement wins"
 assert required_years("x", "0-2 years of experience. 5+ years preferred") == 0, "nice-to-haves ignored"
