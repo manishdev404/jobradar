@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections
 import os
 import re
+import sys
 import threading
 import time
 import traceback
@@ -27,6 +28,7 @@ from pathlib import Path
 from ..store import Store
 from . import resumes, sites
 from .answers import Profile, choose_option, norm
+from .dataset import NoTrace, Trace
 from .learn import ANCHOR_JS, Recorder, anchor_key
 from .writer import Writer
 
@@ -55,6 +57,8 @@ class Run:
         self.job = {"company": app["company"], "title": app["title"], "url": app["url"],
                     "description": app.get("description") or ""}
         self.assisted = False       # you finished a step by hand
+        # everything this application does, kept as training data (dataset.py)
+        self.trace = getattr(engine, "_trace", None) or NoTrace()
         self.written: dict[str, str] = {}
         self.replayed: set[str] = set()   # pages whose recipe this job already tried
 
@@ -79,6 +83,7 @@ class Run:
             self.log(f"model unavailable ({type(e).__name__}) - asking you")
             return None
         self.written[key] = text
+        self.trace.source(question, "ai_written")
         return text or None
 
     def infer(self, question: str, options: list[str]) -> str | None:
@@ -87,6 +92,7 @@ class Run:
         except Exception:  # noqa: BLE001
             return None
         if ans is not None:
+            self.trace.source(question, "ai")
             self.log(f"from your resume: {question[:60]} -> {ans[:40]}")
         return ans
 
@@ -102,6 +108,7 @@ class Run:
         if options:
             ans = choose_option(ans, options) or ans
         self.profile.learn(question, ans)
+        self.trace.source(question, "you")
         self.log(f"you answered: {question[:60]} -> {ans[:40]}")
         return ans
 
@@ -167,6 +174,24 @@ class Run:
         self.engine.snap(force=True)
 
 
+def left_half() -> dict | None:
+    """The left half of the main screen, taskbar excluded: where the engine's
+    Chrome window goes so the Job apply queue page fits on the right half.
+    Windows only; None elsewhere (the window opens where Chrome likes)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        if not ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+            return None                    # 0x0030 = SPI_GETWORKAREA
+    except Exception:  # noqa: BLE001
+        return None
+    return {"left": r.left, "top": r.top,
+            "width": (r.right - r.left) // 2, "height": r.bottom - r.top}
+
+
 class Engine:
     GAP_SECONDS = 15          # pause between applications
 
@@ -191,6 +216,8 @@ class Engine:
         self._screen_at = 0.0
         self._page = None
         self._recorder: Recorder | None = None
+        self._place = False       # move the window to the left half at the next chance
+        self._trace: Trace | None = None   # the application in hand, as training data
 
     def learned_buttons(self, url: str) -> list[str]:
         return self._recorder.buttons_for(url) if self._recorder else []
@@ -235,6 +262,31 @@ class Engine:
             self._skip = True
         self._wake.set()
 
+    def place_left(self) -> bool:
+        """Ask for the Chrome window on the left half of the screen. Playwright
+        may only be driven from the engine's thread, so it moves there within
+        a few seconds. False when no window is open."""
+        self._place = True
+        return bool(self.state["running"])
+
+    def _place_window(self) -> None:
+        self._place = False
+        bounds = left_half()
+        if self.headless or bounds is None or self._page is None:
+            return
+        try:
+            cdp = self._page.context.new_cdp_session(self._page)
+            wid = cdp.send("Browser.getWindowForTarget")["windowId"]
+            # minimised then normal: Windows lifts a restored window above the
+            # others, so it is not left hidden behind the jobs page
+            for state in ("minimized", "normal"):
+                cdp.send("Browser.setWindowBounds",
+                         {"windowId": wid, "bounds": {"windowState": state}})
+            cdp.send("Browser.setWindowBounds", {"windowId": wid, "bounds": bounds})
+            cdp.detach()
+        except Exception:  # noqa: BLE001 - a closing tab; the next job places it again
+            pass
+
     def snapshot(self) -> dict:
         with self._lock:
             snap = {**self.state, "log": list(self._log)[-120:], "screen_at": self._screen_at}
@@ -269,6 +321,8 @@ class Engine:
         """Keep the latest picture of the browser for the Apply status page."""
         if self._page is None or threading.current_thread() is not self._thread:
             return
+        if self._place:
+            self._place_window()
         now = time.time()
         if not force and now - self._screen_at < 0.8:
             return
@@ -312,6 +366,8 @@ class Engine:
             self.state["waiting"] = None
             self.state["phase"] = "working"
             answer = self._answer
+        if self._trace is not None:
+            self._trace.pause(kind, message, list(rec.steps) if rec else [], answer)
         if app_id:
             store.update_application(app_id, "applying")
         if self._skip:
@@ -340,17 +396,24 @@ class Engine:
             profile.login_password          # fail now, not halfway into a signup
             llm = self.llm_factory() if self.llm_factory else None
             writer = Writer(llm, profile)
+            # The window opens on the left half of the screen and pages fill it,
+            # so the Job apply queue page sits beside it on the right.
+            half = None if self.headless else left_half()
+            size = ({"no_viewport": True} if half else
+                    {"viewport": {"width": 1280, "height": 860}})
+            where = ([f"--window-position={half['left']},{half['top']}",
+                      f"--window-size={half['width']},{half['height']}"] if half else [])
             with sync_playwright() as pw:
                 ctx = pw.chromium.launch_persistent_context(
                     str(self.root / "private" / "browser-profile"), headless=self.headless,
-                    viewport={"width": 1280, "height": 860}, accept_downloads=False,
+                    accept_downloads=False, **size,
                     args=["--disable-blink-features=AutomationControlled",
                           # A window behind VS Code is "occluded" and Chrome
                           # slows its timers: dropdowns never open, uploads
                           # never finish. Keep it running at full speed.
                           "--disable-backgrounding-occluded-windows",
                           "--disable-renderer-backgrounding",
-                          "--disable-background-timer-throttling"])
+                          "--disable-background-timer-throttling", *where])
                 self._recorder = Recorder(profile)
                 self._recorder.attach(ctx)     # learns from steps you finish by hand
                 self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -381,6 +444,8 @@ class Engine:
                 continue
             app = self._store.next_queued()
             if app is None:
+                if self._place:
+                    self._place_window()
                 with self._lock:
                     self.state.update(phase="idle", current=None)
                 if not idle_logged:
@@ -414,6 +479,8 @@ class Engine:
         except Exception:  # noqa: BLE001
             pass
         board = sites.board_for(app.get("board"), app.get("url") or "")
+        trace = self._trace = Trace(self.root, app, board.name)
+        run = None
         with self._lock:
             self.state.update(phase="working", current={
                 "app_id": app_id, "company": app["company"], "title": app["title"],
@@ -431,12 +498,14 @@ class Engine:
             with self._lock:
                 self.state["current"]["resume"] = resume["path"].name
             self.log(f"resume: {resume['path'].name} ({resume['why']})")
+            trace.resume(resume["path"].name)
             run = Run(self, app, page, profile, writer, resume)
             try:
                 board(run).apply()
             except sites.DryRunDone:
                 store.update_application(app_id, "queued")
                 self.log("dry run: every page filled - stopped before Submit")
+                trace.finish("dry_run", assisted=run.assisted)
                 self._proof(page, f"dry-{app_id}")
                 with self._lock:
                     self._stop = True
@@ -450,18 +519,22 @@ class Engine:
             with self._lock:
                 self.state["done_this_run"] += 1
             self.log("✓ applied")
+            trace.finish("applied", assisted=run.assisted)
         except Skipped:
             store.update_application(app_id, "not_applied", notes="skipped in the apply queue")
             self.log("skipped - removed from the queue")
+            trace.finish("skipped", assisted=bool(run and run.assisted))
         except Stopped:
             store.update_application(app_id, "queued")
             self.log("stopped - job kept in the queue")
+            trace.finish("stopped", assisted=bool(run and run.assisted))
         except Exception as e:  # noqa: BLE001 - one job failing must not stop the queue
             if "has been closed" in str(e) or type(e).__name__ == "TargetClosedError":
                 # The Chrome window was closed: not this job's fault. Back to
                 # the queue, and stop - there is no browser to go on with.
                 store.update_application(app_id, "queued")
                 self.log("the Chrome window was closed - job kept in the queue; press Start again")
+                trace.finish("stopped", "the Chrome window was closed", bool(run and run.assisted))
                 with self._lock:
                     self._stop = True
                     self.state["error"] = "The Chrome window was closed. Press Start to open it again."
@@ -470,6 +543,7 @@ class Engine:
             self._proof(page, app_id)
             store.update_application(app_id, "failed", notes=f"AI engine: {why}"[:500])
             self.log(f"✗ failed: {why[:200]}")
+            trace.finish("failed", why, bool(run and run.assisted))
             if os.environ.get("JOBRADAR_APPLY_DEBUG"):
                 self.log(traceback.format_exc()[-1500:])
 

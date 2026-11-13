@@ -44,6 +44,7 @@ class Board:
     def __init__(self, run):
         self.run = run
         self.page = run.page
+        self.special: list[dict] = []   # fields this board fills its own way (calendars...)
 
     # -- the flow ---------------------------------------------------------------
     def apply(self) -> None:
@@ -88,6 +89,7 @@ class Board:
             run.stage(f"filling page {step + 1}" if step else "filling the form")
             missing = forms.fill(run, page)
             self.after_fill(page)
+            self._record_page(page)
             missing = [f for f in missing if not self._now_filled(f)]
             if missing:
                 names = "; ".join(f["label"][:60] or f["kind"] for f in missing[:6])
@@ -99,6 +101,7 @@ class Board:
             before = self._signature()
             final = self.press_next()
             if final is None:
+                run.trace.outcome("no button found")
                 run.wait("manual", "I cannot find the button to go on. Click it in the Chrome "
                                    "window (or finish the application there), then press Continue. "
                                    "I will remember which button it was.", learn_button=True)
@@ -107,6 +110,7 @@ class Board:
                 continue
             run.stage("submitting" if final else "next page")
             outcome = self.wait_outcome(before)
+            run.trace.outcome(outcome, forms.errors(self.page) if outcome == "stuck" else [])
             if outcome == "done":
                 return
             if outcome == "captcha":
@@ -145,11 +149,27 @@ class Board:
     def after_fill(self, page) -> None:
         pass
 
+    def _record_page(self, page) -> None:
+        """The page as filled, for the training data (dataset.py)."""
+        try:
+            self.run.trace.page(page.url, forms.scan(page) + self.special)
+            self.special = []
+        except Exception:  # noqa: BLE001 - mid-navigation: the record skips this page
+            pass
+
+    def _pressed(self, item, final: bool) -> None:
+        try:
+            text = item if isinstance(item, str) else (item.inner_text(timeout=1000) or "")
+        except Exception:  # noqa: BLE001
+            text = ""
+        self.run.trace.pressed(text, final)
+
     def press_next(self) -> bool | None:
         """True: pressed Submit. False: pressed Next. None: found neither."""
         submit = forms.find_first(self.page, self.submit_patterns)
         if submit is not None:
             self._submit_gate()
+            self._pressed(submit, True)
             forms.safe_click(submit)
             return True
         # buttons you pressed on this site before, when I could not find the way on
@@ -161,9 +181,13 @@ class Board:
             if final:
                 self._submit_gate()
             self.run.log(f"pressing “{text}” (learned from you)")
+            self._pressed(text, final)
             forms.safe_click(item)
             return final
-        if forms.click_first(self.page, self.next_patterns):
+        item = forms.find_first(self.page, self.next_patterns)
+        if item is not None:
+            self._pressed(item, False)
+            forms.safe_click(item)
             return False
         return None
 
@@ -554,18 +578,94 @@ class Workday(Board):
             label = (btn.first.inner_text() or "").strip().lower()
             if label.startswith("submit"):
                 self._submit_gate()
+            self._pressed(label, label.startswith("submit"))
             forms.safe_click(btn.first)
             return label.startswith("submit")
         return super().press_next()
 
 
+class Keka(Board):
+    """*.keka.com: the shared flow, plus two fields it cannot work on its own -
+    Date of Birth is a read-only box with a jQuery UI calendar, and the phone's
+    country code is a select2 dropdown in front of the number."""
+    name = "keka"
+    CALENDAR = "#ui-datepicker-div"
+
+    def after_fill(self, page) -> None:
+        self._date_of_birth(page)
+        self._country_code(page)
+
+    def _date_of_birth(self, page) -> None:
+        box = page.locator("input.date-of-birth, input#dateOfBirth").filter(visible=True)
+        if not box.count() or box.first.input_value():
+            return
+        m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})", str(self.run.profile.get("personal.date_of_birth")))
+        if not m:
+            return
+        year, month, day = (int(x) for x in m.groups())
+        try:
+            # as you would: open the calendar, year from its list, month, then the day
+            box.first.click()
+            cal = page.locator(self.CALENDAR)
+            cal.wait_for(state="visible", timeout=4000)
+            cal.locator("select.ui-datepicker-year").select_option(str(year))
+            time.sleep(0.3)
+            cal.locator("select.ui-datepicker-month").select_option(str(month - 1))
+            time.sleep(0.3)
+            cal.locator('td[data-handler="selectDay"] a').filter(
+                has_text=re.compile(rf"^\s*{day}\s*$")).first.click()
+            time.sleep(0.4)
+            self.run.log(f"Date of Birth: {box.first.input_value()}")
+            self.special.append({"label": "Date of Birth", "kind": "date picker", "required": False,
+                                 "value": box.first.input_value(), "options": []})
+            self.run.trace.source("Date of Birth", "profile")
+        except Exception as e:  # noqa: BLE001 - the field stays empty; the run goes on
+            page.keyboard.press("Escape")
+            self.run.log(f"could not pick Date of Birth in the calendar: {type(e).__name__}")
+
+    def _country_code(self, page) -> None:
+        code = str(self.run.profile.get("personal.phone_country_code") or "+91")
+        country = str(self.run.profile.get("personal.country") or "India")
+        selects = page.locator("select.countryCode")
+        for i in range(selects.count()):
+            sel = selects.nth(i)
+            try:
+                if sel.input_value() == code:
+                    continue
+                # as you would: open the dropdown, search the country, pick it
+                sel.locator("xpath=following-sibling::span[contains(@class,'select2')][1]"
+                            "//span[contains(@class,'select2-selection')]").first.click()
+                search = page.locator(".select2-container--open .select2-search__field")
+                search.wait_for(state="visible", timeout=3000)
+                search.fill(country)
+                time.sleep(0.7)
+                page.locator(".select2-container--open .select2-results__option").filter(
+                    has_text=re.compile(rf"^\s*{re.escape(country)}\s*\(", re.I)).first.click()
+                time.sleep(0.3)
+            except Exception:  # noqa: BLE001 - set the list behind the dropdown instead
+                page.keyboard.press("Escape")
+                try:
+                    sel.select_option(code, force=True)
+                    sel.dispatch_event("change")
+                except Exception:  # noqa: BLE001
+                    pass
+            if sel.input_value() == code:
+                self.run.log(f"phone country code: {country} ({code})")
+                self.special.append({"label": "Mobile Phone country code", "kind": "select2",
+                                     "required": True, "value": f"{country} ({code})", "options": []})
+                self.run.trace.source("Mobile Phone country code", "profile")
+            else:
+                self.run.log("could not set the phone country code")
+
+
 class Generic(Board):
-    """Keka, Zoho Recruit, Oracle, Darwinbox and any other board: the shared flow,
+    """Zoho Recruit, Oracle, Darwinbox and any other board: the shared flow,
     which signs in, fills what it can and hands you anything it cannot."""
     name = "generic"
 
 
-ENGINES = {"greenhouse": Greenhouse, "lever": Lever, "ashby": Ashby, "workday": Workday}
+ENGINES = {"greenhouse": Greenhouse, "lever": Lever, "ashby": Ashby, "workday": Workday,
+           "keka": Keka}
 
 
 def board_for(source: str | None, url: str):
@@ -574,7 +674,7 @@ def board_for(source: str | None, url: str):
         return ENGINES[source]
     host = urlparse(url).netloc.lower()
     for key, cls in (("greenhouse", Greenhouse), ("lever.co", Lever), ("ashbyhq", Ashby),
-                     ("myworkdayjobs", Workday), ("workday", Workday)):
+                     ("myworkdayjobs", Workday), ("workday", Workday), ("keka.com", Keka)):
         if key in host:
             return cls
     return Generic

@@ -257,9 +257,11 @@ def answer(run, f: dict, fallback: bool = True) -> str | None:
     if re.search(r"(?i)captcha", label):
         return None                     # yours to solve; the engine pauses for it
     v = run.profile.recall(label)
+    _by(run, label, "remembered" if v is not None else "")
     if v is None:
         from .answers import rule_answer
         v = rule_answer(run.profile, label, kind)
+        _by(run, label, "profile" if v is not None else "")
     if v is None and OPEN.search(norm(label)) and (f["required"] or kind == "textarea"):
         # Written from the job description and your resume together.
         v = run.write(label)
@@ -275,6 +277,13 @@ def answer(run, f: dict, fallback: bool = True) -> str | None:
     if v is None and f["required"]:
         v = run.ask(label, options)
     return v
+
+
+def _by(run, label: str, who: str) -> None:
+    """Note who answered a field, for the training data (dataset.py)."""
+    trace = getattr(run, "trace", None)
+    if trace is not None and who:
+        trace.source(label, who)
 
 
 def is_question(f: dict) -> bool:
