@@ -6,7 +6,7 @@ import html as html_mod
 import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -65,6 +65,33 @@ def _epoch(value) -> float | None:
         return datetime.fromisoformat(s).timestamp()
     except Exception:
         return None
+
+
+_POSTED_ISO = re.compile(r"(?:date ?posted|posted(?: on)?|date opened)\s*[:\-]?\s*"
+                         r"(\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d\d:?\d\d)?)?)", re.I)
+_POSTED_AGO = re.compile(r"posted\s*[:\-]?\s*(?:on\s*)?(today|just now|yesterday|"
+                         r"(\d+)\+?\s*(minute|hour|day|week|month|year)s?\s*ago)", re.I)
+_UNIT = {"minute": 60, "hour": 3600, "day": 86400, "week": 7 * 86400,
+         "month": 30 * 86400, "year": 365 * 86400}
+
+
+def posted_from_text(text: str | None, now: float | None = None) -> float | None:
+    """When a posting went up, from words a board prints: "Posted 2 Days Ago",
+    "Posted 30+ Days Ago" (counted as 30: at least that old), "Posted: 9
+    months ago", "Date posted: 2025-12-17". None when it says nothing."""
+    text, now = text or "", now or time.time()
+    m = _POSTED_ISO.search(text)
+    if m:
+        return _epoch(m.group(1))
+    m = _POSTED_AGO.search(text)
+    if not m:
+        return None
+    word = m.group(1).lower()
+    if word in ("today", "just now"):
+        return now
+    if word == "yesterday":
+        return now - 86400
+    return now - int(m.group(2)) * _UNIT[m.group(3).lower()]
 
 
 # --------------------------------------------------------------------------
@@ -207,7 +234,7 @@ def workday(name: str, slug: str) -> list[dict]:
             path = j.get("externalPath") or ""
             out.append(_norm(
                 name, j.get("title"), f"{base}/{site}{path}",
-                j.get("locationsText", ""), None,
+                j.get("locationsText", ""), posted_from_text(j.get("postedOn")),
                 j.get("bulletFields") and " ".join(j["bulletFields"]) or "", "workday"))
         if len(postings) < 20:
             break
@@ -349,7 +376,9 @@ def _workday_details(url: str) -> str:
     u = urlparse(url)
     tenant = u.netloc.split(".")[0]
     data = _get(f"https://{u.netloc}/wday/cxs/{tenant}{u.path}")
-    return (data.get("jobPostingInfo") or {}).get("jobDescription") or ""
+    info = data.get("jobPostingInfo") or {}
+    when = info.get("startDate") or ""
+    return (f"Date posted: {when}\n" if when else "") + (info.get("jobDescription") or "")
 
 
 def _oracle_details(url: str) -> str:
@@ -410,7 +439,9 @@ def _zoho_details(url: str) -> str:
         return ""
     import json as _json
     job = (_json.loads(_js_unescape(m.group(1))) or [{}])[0]
-    return (f"Experience: {job.get('Work_Experience') or 'not stated'}\n"
+    opened = str(job.get("Date_Opened") or "")[:10]
+    return ((f"Date opened: {opened}\n" if re.match(r"\d{4}-\d\d-\d\d", opened) else "")
+            + f"Experience: {job.get('Work_Experience') or 'not stated'}\n"
             f"{job.get('Job_Description') or ''}")
 
 
@@ -419,13 +450,49 @@ DETAILS = {"workday": _workday_details, "oracle": _oracle_details,
            "zoho": _zoho_details}
 
 
-def fetch_details(job: dict) -> str:
-    """Full description for a job whose board listed none. Never raises: a
-    failed lookup leaves the job as it was ("experience not stated")."""
-    fn = DETAILS.get(job.get("source", ""))
-    if not fn:
+def _greenhouse_by_jid(job: dict) -> str:
+    """A company page showing a Greenhouse job (".../careers/job?gh_jid=123")
+    draws the description with a script, so reading the page finds an empty
+    shell. Greenhouse has it: try the board names the company is likely
+    filed under - the site's name, then the company's."""
+    url = job.get("url") or ""
+    jid = (parse_qs(urlparse(url).query).get("gh_jid") or [""])[0]
+    if not jid.isdigit():
         return ""
+    host = urlparse(url).netloc.lower().split(":")[0]
+    parts = [p for p in host.split(".") if p not in ("www", "careers", "jobs", "boards", "job-boards")]
+    name = re.sub(r"[^a-z0-9]", "", (job.get("company") or "").lower())
+    tokens = [t for t in dict.fromkeys([parts[0] if parts else "", name,
+                                        re.sub(r"(inc|labs|technologies|tech|india)$", "", name)]) if t]
+    for tok in tokens:
+        try:
+            content = _get(f"https://boards-api.greenhouse.io/v1/boards/{tok}/jobs/{jid}").get("content")
+        except Exception:  # noqa: BLE001 - wrong board name: try the next
+            continue
+        if content:
+            return content
+    return ""
+
+
+def fetch_details(job: dict) -> str:
+    """Full description of one posting, for the experience gate. Never raises:
+    a failed lookup leaves the job as it was ("experience not stated").
+
+    Every board gets a reader: its own when it has one, else the posting's
+    page (its JobPosting data, else the page text)."""
     try:
+        text = _greenhouse_by_jid(job)
+        if text:
+            return text
+        fn = DETAILS.get(job.get("source", ""))
+        if fn is None:
+            from .boards_more import _page_details
+            return _page_details(job["url"]) if job.get("url") else ""
         return fn(job) if fn is _greenhouse_details else fn(job["url"])
     except Exception:  # noqa: BLE001
         return ""
+
+
+# More platforms and the generic careers-page reader register themselves into
+# BOARDS (and DETAILS) on import; kept in their own module for size.
+from . import boards_more  # noqa: E402,F401

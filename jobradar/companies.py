@@ -36,8 +36,26 @@ _PATTERNS = (
     ("keka", r"([a-z0-9-]+)\.keka\.com", lambda m: m.group(1)),
     ("darwinbox", r"([a-z0-9.-]+\.darwinbox\.(?:in|com))", lambda m: m.group(1)),
     ("zoho", r"([a-z0-9.-]+\.zohorecruit\.(?:in|com|eu))", lambda m: m.group(1)),
+    # boards_more.py
+    ("smartrecruiters", r"(?:jobs|careers)\.smartrecruiters\.com/(?!oneclick)([A-Za-z0-9_-]+)",
+     lambda m: m.group(1)),
+    ("smartrecruiters", r"api\.smartrecruiters\.com/v1/companies/([A-Za-z0-9_-]+)", lambda m: m.group(1)),
+    ("bamboohr", r"([a-z0-9-]+)\.bamboohr\.com", lambda m: m.group(1)),
+    ("recruitee", r"([a-z0-9-]+)\.recruitee\.com", lambda m: m.group(1)),
+    ("freshteam", r"([a-z0-9-]+)\.freshteam\.com", lambda m: m.group(1)),
+    ("breezy", r"([a-z0-9-]+\.breezy\.hr)", lambda m: m.group(1)),
+    ("pinpoint", r"([a-z0-9-]+\.pinpointhq\.com)", lambda m: m.group(1)),
+    ("teamtailor", r"([a-z0-9-]+\.teamtailor\.com)", lambda m: m.group(1)),
+    ("jazzhr", r"([a-z0-9-]+\.applytojob\.com)", lambda m: m.group(1)),
+    ("jobvite", r"jobs\.jobvite\.com/(?:careers/)?([A-Za-z0-9_-]+)", lambda m: m.group(1)),
+    ("icims", r"([a-z0-9-]+\.icims\.com)", lambda m: m.group(1)),
+    ("workdaysite", r"(wd\d+)\.myworkdaysite\.com/(?:[a-z]{2}-[A-Z]{2}/)?recruiting/([A-Za-z0-9_-]+)/"
+                    r"([A-Za-z0-9_-]+)", lambda m: f"{m.group(1)}/{m.group(2)}/{m.group(3)}"),
 )
 _READABLE = set(sources.BOARDS) - {"atlassian"}
+# The platforms' own sites, not a company's board: www.bamboohr.com, help.keka.com...
+_NOT_TENANT = {"www", "help", "blog", "app", "api", "support", "docs", "status", "partners", "go",
+               "info", "marketplace", "community", "developers", "static", "cdn", "login", "careers"}
 
 
 def detect_board(url: str) -> tuple[str, str]:
@@ -46,7 +64,12 @@ def detect_board(url: str) -> tuple[str, str]:
     for board, pattern, slug in _PATTERNS:
         m = re.search(pattern, url or "", re.I)
         if m:
-            return (board, slug(m)) if slug else ("other", "")
+            if not slug:
+                return "other", ""
+            s = slug(m)
+            if s.split(".")[0].lower() in _NOT_TENANT:
+                continue
+            return board, s
     return "other", ""
 
 
@@ -63,6 +86,21 @@ def careers_url(board: str, slug: str) -> str:
         "keka": f"https://{slug}.keka.com/careers",
         "darwinbox": f"https://{slug}/ms/candidate/careers",
         "zoho": f"https://{slug}/jobs/Careers",
+        "smartrecruiters": f"https://jobs.smartrecruiters.com/{slug}",
+        "bamboohr": f"https://{slug}.bamboohr.com/careers",
+        "recruitee": f"https://{slug}.recruitee.com",
+        "freshteam": f"https://{slug}.freshteam.com/jobs",
+        "breezy": f"https://{slug}",
+        "pinpoint": f"https://{slug}",
+        "teamtailor": f"https://{slug}",
+        "jazzhr": f"https://{slug}/apply",
+        "jobvite": f"https://jobs.jobvite.com/{slug}/jobs",
+        "icims": f"https://{slug}/jobs",
+        "workdaysite": "https://{0}.myworkdaysite.com/recruiting/{1}/{2}".format(*slug.split("/"))
+        if slug.count("/") == 2 else "",
+        "successfactors": f"https://{slug}/search/",
+        "phenom": slug,
+        "page": slug,
     }.get(board, "")
 
 
