@@ -43,6 +43,17 @@ filters:
   title_exclude: ["staff", "principal", "director", "manager", "vp ",
                   "head of", "lead ", "architect", "10+ years"]
   locations: []                        # e.g. ["india", "remote"]; empty = anywhere
+  # With `roles:` set (see jobradar/roles.py), a title naming no role is
+  # dropped. skill_match keeps such a job when its title is an engineering one
+  # and its full posting names min_skills of your skills.top
+  # (jobradar/skillmatch.py). Shown as role "Skill match".
+  # skill_match:
+  #   enabled: true
+  #   min_skills: 3
+  #   priority: 6                      # sorts after your own roles
+  #   title_words: ["engineer", "developer", "programmer", "sde", "member of technical staff"]
+  #   exclude_words: ["qa", "test", "sales", "support", "data", "devops", "android", "ios",
+  #                   "mechanical", "electrical", "embedded", "salesforce", ".net", "php"]
 
 # ---- decision model ----
 llm:
@@ -84,3 +95,15 @@ alerts:
   companies: [Adobe, Oracle, Atlassian]   # checked daily; keep it short
   min_score: 6                         # unscored jobs always alert
   max_per_alert: 15
+
+# ---- scan speed ----
+# fetch_concurrency: 16       # boards read at once
+# Slow careers sites get their own queue so they never hold up the fast ones.
+# slow_concurrency: 4         # of those workers, how many serve the slow queue
+# slow_after_secs: 8          # a board this slow last time starts in the slow queue
+# fast_timeout: 8             # seconds a fast-queue request gets; a timeout moves the board to the slow queue
+
+# ---- reading each posting (jobradar/details/) ----
+# details:
+#   browser: true             # render pages drawn by JavaScript in headless Chromium
+#   browser_max: 25           # at most this many renders per scan
