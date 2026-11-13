@@ -112,12 +112,14 @@ CREATE INDEX IF NOT EXISTS idx_app_events ON application_events(app_id);
 # application, so it is the one status that leaves a job in scoring, digests
 # and alerts.
 STATUSES = ("not_applied", "queued", "applying", "needs_you", "failed", "in_process",
-            "referral", "applied", "ai_applied", "contacted", "assessment", "interview",
-            "offer", "rejected", "expired", "withdrawn")
+            "referral_asked", "referral_got", "applied", "ai_applied", "contacted", "assessment",
+            "interview", "offer", "rejected", "expired", "withdrawn", "over_exp")
 
-# The AI apply engine's own stages. None of them is an application yet, so
-# none of them sets applied_at - that waits for the submit.
-PRE_APPLY = ("not_applied", "queued", "applying", "needs_you", "failed")
+# The AI apply engine's own stages, a referral asked for but not yet given,
+# and a job set aside as asking for more experience. None of them is an application yet, so none of them sets applied_at -
+# that waits for the submit.
+PRE_APPLY = ("not_applied", "queued", "applying", "needs_you", "failed", "referral_asked",
+             "over_exp")
 # What the apply queue holds, the job being worked on first.
 QUEUE = ("applying", "needs_you", "queued")
 
@@ -128,7 +130,9 @@ _NOT_APPLIED = ("id NOT IN (SELECT job_id FROM applications "
 
 class Store:
     def __init__(self, path: str | Path = "jobradar.db"):
-        self.db = sqlite3.connect(str(path))
+        # The scan, the web app and the scheduled task share this file; wait for
+        # another writer's commit instead of failing after sqlite's default 5 s.
+        self.db = sqlite3.connect(str(path), timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self._migrate()
@@ -152,6 +156,10 @@ class Store:
                     f"ALTER TABLE applications ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         if "queued_at" not in have:
             self.db.execute("ALTER TABLE applications ADD COLUMN queued_at REAL")
+        # 'referral' split into asked / got; an old one was an application made
+        # through a referral.
+        for table in ("applications", "application_events"):
+            self.db.execute(f"UPDATE {table} SET status = 'referral_got' WHERE status = 'referral'")
 
     # -- ingest -------------------------------------------------------------
     def upsert(self, jobs: list[dict]) -> list[dict]:
@@ -330,6 +338,13 @@ class Store:
         return {r["company"]: r["fetched_at"] for r in
                 self.db.execute("SELECT company, fetched_at FROM boards")}
 
+    def active_companies(self) -> set[str]:
+        """Companies worth reading on every scan: India tech jobs at their last
+        check, or a job of theirs still open in the list."""
+        return {r[0] for r in self.db.execute(
+            "SELECT name FROM companies WHERE india_tech_jobs > 0 "
+            "UNION SELECT company FROM jobs WHERE closed_at IS NULL")}
+
     def fresh_boards(self, max_age_hours: float) -> set[str]:
         """Companies fetched successfully within max_age_hours - safe to skip."""
         if not max_age_hours or max_age_hours <= 0:
@@ -412,6 +427,37 @@ class Store:
                                                              job["description"] or ""),
             skills=", ".join(job_skills(job["title"], job["description"] or "")),
         )
+
+    def descriptions(self, ids: list[str]) -> dict[str, str]:
+        """id -> saved description, for the jobs that have one."""
+        out: dict[str, str] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            out.update({r["id"]: r["description"] for r in self.db.execute(
+                f"SELECT id, description FROM jobs WHERE id IN ({marks}) AND description != ''",
+                chunk)})
+        return out
+
+    def set_description(self, job_id: str, text: str, experience: str) -> None:
+        self.db.execute("UPDATE jobs SET description = ?, experience = ? WHERE id = ?",
+                        (text[:20000], experience, job_id))
+        self.db.commit()
+
+    def expire_old(self, days: float) -> int:
+        """Postings the board says went up more than `days` ago are marked
+        expired - a queued one leaves the queue. Jobs you already acted on
+        (applied, in process, referral...) keep their status. Returns how many."""
+        if not days or days <= 0:
+            return 0
+        rows = self.db.execute(
+            """SELECT j.id FROM jobs j WHERE j.posted_at > 0 AND j.posted_at < ?
+               AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id = j.id
+                               AND a.status NOT IN ('not_applied', 'queued', 'failed'))""",
+            (time.time() - days * 86400,)).fetchall()
+        for r in rows:
+            self.set_job_status(r["id"], "expired", f"posted more than {days:g} days ago")
+        return len(rows)
 
     # -- apply queue (the AI apply engine) ------------------------------------
     def enqueue(self, job_id: str) -> int:

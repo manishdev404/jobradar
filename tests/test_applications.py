@@ -117,7 +117,9 @@ for desc, want in [
         assert too_senior({"title": "Software Engineer", "description": desc}, 1), desc[:60]
 
 # --- tracker import status mapping --------------------------------------------
-for raw, want in [("A Refrral", "referral"), ("B Application Submitted", "applied"),
+for raw, want in [("A Refrral", "referral_got"), ("Asked for referral", "referral_asked"),
+                  ("Referral asked", "referral_asked"), ("Over exp", "over_exp"),
+                  ("Overqualified / too senior", "over_exp"), ("B Application Submitted", "applied"),
                   ("C JOb exppired", "expired"), ("D Rejected", "rejected"),
                   ("First round Rejetct", "rejected"), ("First technical round", "interview"),
                   ("H Draft", "not_applied"), ("E Message send", "contacted"), ("", "applied")]:

@@ -18,6 +18,7 @@ from .store import Store
 
 # First match wins, so the more specific stages come first.
 _STATUS_RULES = (
+    (r"over.?exp|over.?qualif|too senior|more experience|exp\w* mismatch", "over_exp"),
     (r"\brej|declin|not selected", "rejected"),
     (r"exp+ire|closed|no longer", "expired"),
     (r"withdr", "withdrawn"),
@@ -25,7 +26,8 @@ _STATUS_RULES = (
     (r"interview|round|technical|\bhr\b", "interview"),
     (r"assess|test|assignment|exam|\boa\b", "assessment"),
     (r"message|mail|contact|reach", "contacted"),
-    (r"re+f+e?r+a?l|\breff?\b", "referral"),
+    (r"ask\w*\W+(for\W+)?(an?\W+)?re+f+e?r+a?l|re+f+e?r+a?l\W+ask", "referral_asked"),
+    (r"re+f+e?r+a?l|\breff?\b", "referral_got"),
     (r"in (the )?process|in progress", "in_process"),
     (r"draft|not applied|to apply|need to apply|saved", "not_applied"),
     (r"submit|applied|apply", "applied"),
