@@ -10,7 +10,6 @@ import json
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -21,8 +20,8 @@ from pydantic import BaseModel
 from .. import sources
 from ..cursor import CursorError
 from ..llm import RateLimited
-from ..main import (ROOT, boards_due, get_profile, get_scorer, load_config, select_jobs,
-                    start_crawl)
+from ..main import (ROOT, boards_due, details_report, fetch_boards, get_profile, get_scorer,
+                    load_config, select_jobs, start_crawl)
 from ..resume import build_details, extract_text, parse_details
 from ..relevance import apply_cap as apply_relevance_cap
 from ..seniority import apply_cap
@@ -310,6 +309,7 @@ def state():
     rows = s.db.execute(
         """SELECT id, company, title, url, location, score, reason, domain, source,
                   breakdown, posted_at, first_seen, closed_at, experience, role, role_rank, role_bonus,
+                  work_mode, employment_type, salary, closes_at, first_posted, skills, skills_nice,
                   (SELECT a.status FROM applications a WHERE a.job_id = jobs.id
                    ORDER BY a.updated_at DESC LIMIT 1) AS app_status
            FROM jobs
@@ -373,7 +373,9 @@ def _mosaic(jobs: list[dict], limit: int) -> list[dict]:
 
 
 def _scan_events(limit: int, full: bool = False, days: int = 0, smart: bool = False):
-    """Generator of SSE events. Fetch first, then score, emitting per job.
+    """Generator of SSE events. Fetching and scoring run side by side: one
+    thread fetches every company and saves the jobs a group at a time, a
+    second scores whatever has been saved, so neither waits on the other.
     days: only jobs posted in the last `days` days are scored (the page's
     "posted" filter); every job is still saved, so none looks closed."""
     c = cfg()
@@ -383,78 +385,45 @@ def _scan_events(limit: int, full: bool = False, days: int = 0, smart: bool = Fa
     def emit(kind, **data):
         q.put(f"data: {json.dumps({'type': kind, **data})}\n\n")
 
-    def work():
-        # sqlite3 connections are bound to the thread that created them, so the
-        # worker opens its own rather than borrowing the request thread's.
+    saved = threading.Event()        # a group was saved: there may be jobs to score
+    fetched_all = threading.Event()  # no more groups are coming
+    halt = threading.Event()         # the scan failed: scoring stops too
+    desc: dict[str, str] = {}        # descriptions read this scan, for the scorer
+    prog = {"batch": 0, "batches": 1, "scored": 0}
+
+    def score_loop():
+        # sqlite3 connections are bound to the thread that created them, so
+        # scoring opens its own rather than sharing the fetch thread's.
         s = store()
-        crawl = None
+        tried: set[str] = set()      # one try per scan; a job the model drops waits for the next
         try:
-            # Same rules as cmd_scan: skip boards read within refresh_hours,
-            # unless full (the web Scan button always asks for full).
-            fresh = set() if full or smart else s.fresh_boards(float(c.get("refresh_hours", 0) or 0))
-            entries = boards_due(c, s, fresh, full, smart=smart)
-            crawl = start_crawl(c, s, "web", fresh, entries)
-            checked = 0
-            # One click walks every company in batches (scan_batch, default 50):
-            # each batch is fetched, filtered, saved and scored before the next
-            # starts on its own, so results show up batch by batch.
-            size = int(c.get("scan_batch", 50) or 50)
-            batches = [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
-            scoring = c.get("llm", {}).get("provider", "none") != "none"
-            scorer = prof = None
-            done = 0
-            for k, chunk in enumerate(batches, 1):
-                first = (k - 1) * size + 1
-                emit("batch", index=k, count=len(batches), companies=len(chunk),
-                     first=first, last=first + len(chunk) - 1, total=len(entries))
-                all_jobs, healthy, counts = [], [], {}
-                with ThreadPoolExecutor(max_workers=int(c.get("fetch_concurrency", 10))) as pool:
-                    for entry, (jobs, err) in zip(chunk, pool.map(sources.fetch_company, chunk)):
-                        if not err:
-                            healthy.append(entry["name"])
-                            counts[entry["name"]] = len(jobs)
-                            all_jobs.extend(jobs)
-                        emit("fetch", company=entry["name"], count=len(jobs), error=err or "")
-                disc = c.get("discovery", {})
-                if k == 1 and disc.get("enabled"):
-                    jobs, _ = sources.discover(disc.get("queries", []), disc.get("max_per_query", 40))
-                    all_jobs.extend(jobs)
-                    emit("fetch", company="discovery", count=len(jobs), error="")
-
-                kept = select_jobs(all_jobs, c, s, days)
-                desc = {j["id"]: j["description"] for j in kept}
-                new = s.upsert(kept)
-                closed = s.mark_closed(healthy)
-                s.expire_old(float(c.get("expire_after_days", 45) or 0))
-                for name in healthy:
-                    s.mark_fetched(name, counts[name])
-                s.link_applications()
-                s.add_to_crawl(crawl, ok=len(healthy), failed=len(chunk) - len(healthy),
-                               new_jobs=len(new), closed_jobs=len(closed))
-                checked += len(chunk)
-                emit("fetched", new=len(new), closed=len(closed), total=len(kept),
-                     skipped=len(fresh), batch=k, batches=len(batches),
-                     checked=checked, due=len(entries))
-
-                if not scoring:
-                    continue
-                if scorer is None:
-                    scorer = get_scorer(c)
-                    prof = get_profile(c, scorer)
-                rows = s.unscored(limit)
+            scorer = get_scorer(c)
+            prof = get_profile(c, scorer)
+            # A batched backend (Cursor) judges many postings per agent run, so
+            # chunk; a per-job backend gets chunks of one and behaves as before.
+            batched = hasattr(scorer, "score_batch")
+            per = int(c.get("llm", {}).get("batch_size", getattr(scorer, "batch_size", 25)))
+            while not halt.is_set():
+                # Read before querying: a group saved after this is caught next pass.
+                last = fetched_all.is_set()
+                rows = [r for r in s.unscored(limit) if r["id"] not in tried]
                 if days:
                     since = time.time() - days * 86400
                     rows = [r for r in rows if (r["posted_at"] or 0) >= since]
-                emit("scoring", count=len(rows), backlog=s.unscored_count(), batch=k,
-                     batches=len(batches))
-
-                # A batched backend (Cursor) judges many postings per agent run, so
-                # chunk; a per-job backend gets chunks of one and behaves as before.
-                batched = hasattr(scorer, "score_batch")
-                per = int(c.get("llm", {}).get("batch_size", getattr(scorer, "batch_size", 25)))
+                if not rows:
+                    if last:
+                        return
+                    saved.wait(5)
+                    saved.clear()
+                    continue
+                tried.update(r["id"] for r in rows)
+                emit("scoring", count=len(rows), backlog=s.unscored_count(),
+                     batch=prog["batch"], batches=prog["batches"])
                 chunks = ([rows[i:i + per] for i in range(0, len(rows), per)]
                           if batched else [[r] for r in rows])
                 for group in chunks:
+                    if halt.is_set():
+                        return
                     payload = []
                     for row in group:
                         job = dict(row)
@@ -464,17 +433,10 @@ def _scan_events(limit: int, full: bool = False, days: int = 0, smart: bool = Fa
                          title=(f"scoring {len(group)} jobs" if len(group) > 1
                                 else group[0]["title"]),
                          domain=group[0]["domain"] or "")
-                    try:
-                        if batched:
-                            results = scorer.score_batch(prof, payload)
-                        else:
-                            results = {group[0]["id"]: scorer.score(prof, payload[0])}
-                    except (RateLimited, CursorError) as e:
-                        # Out of quota: keep fetching the remaining batches so
-                        # every job is found; they get scored on a later run.
-                        emit("throttled", message=str(e), scored=done)
-                        scoring = False
-                        break
+                    if batched:
+                        results = scorer.score_batch(prof, payload)
+                    else:
+                        results = {group[0]["id"]: scorer.score(prof, payload[0])}
                     for row in group:
                         if row["id"] not in results:
                             continue            # dropped by the model: retried next run
@@ -483,15 +445,117 @@ def _scan_events(limit: int, full: bool = False, days: int = 0, smart: bool = Fa
                         score, reason = apply_cap(score, row["title"], reason)
                         score, reason = apply_relevance_cap(score, breakdown, reason)
                         s.save_score(row["id"], score, reason, breakdown)
-                        done += 1
+                        prog["scored"] += 1
                         emit("scored", id=row["id"], score=score, reason=reason,
                              breakdown=breakdown, company=row["company"], title=row["title"],
                              domain=row["domain"] or "", url=row["url"] or "")
+        except (RateLimited, CursorError) as e:
+            # Out of quota: fetching carries on so every job is found; the rest
+            # get scored on a later run.
+            emit("throttled", message=str(e), scored=prog["scored"])
+        except Exception as e:  # noqa: BLE001 - fetching carries on without scores
+            emit("error", message=f"scoring stopped: {type(e).__name__}: {e}"[:300])
 
-            emit("done", scored=done, elapsed=round(time.time() - started, 1))
+    report = details_report(c)       # every posting this scan reads, per board
+
+    def work():
+        s = store()
+        crawl = None
+        scoring = None
+        try:
+            # Same rules as cmd_scan: skip boards read within refresh_hours,
+            # unless full (the web Scan button always asks for full).
+            fresh = set() if full or smart else s.fresh_boards(float(c.get("refresh_hours", 0) or 0))
+            entries = boards_due(c, s, fresh, full, smart=smart)
+            crawl = start_crawl(c, s, "web", fresh, entries)
+            size = int(c.get("scan_batch", 50) or 50)
+            prog["batches"] = max(1, -(-len(entries) // size))
+            if c.get("llm", {}).get("provider", "none") != "none":
+                scoring = threading.Thread(target=score_loop, daemon=True, name="scan-score")
+                scoring.start()
+            checked = 0
+
+            def begin():
+                prog["batch"] += 1
+                k = prog["batch"]
+                first = (k - 1) * size + 1
+                emit("batch", index=k, count=prog["batches"],
+                     companies=min(size, len(entries) - first + 1), first=first,
+                     last=min(k * size, len(entries)), total=len(entries))
+
+            def save(group):
+                """Filter and save one group of fetched companies (scan_batch,
+                default 50), so results show up group by group."""
+                nonlocal checked
+                k = prog["batch"]
+                all_jobs, healthy, counts = [], [], {}
+                for entry, jobs, err in group:
+                    if not err:
+                        healthy.append(entry["name"])
+                        counts[entry["name"]] = len(jobs)
+                        all_jobs.extend(jobs)
+                disc = c.get("discovery", {})
+                if k == 1 and disc.get("enabled"):
+                    jobs, _ = sources.discover(disc.get("queries", []), disc.get("max_per_query", 40))
+                    all_jobs.extend(jobs)
+                    emit("fetch", company="discovery", count=len(jobs), error="")
+
+                kept = select_jobs(all_jobs, c, s, days, report=report)
+                for j in kept:
+                    desc[j["id"]] = j["description"]
+                new = s.upsert(kept)
+                closed = s.mark_closed(healthy)
+                s.expire_old(float(c.get("expire_after_days", 45) or 0))
+                for name in healthy:
+                    s.mark_fetched(name, counts[name])
+                s.link_applications()
+                s.add_to_crawl(crawl, ok=len(healthy), failed=len(group) - len(healthy),
+                               new_jobs=len(new), closed_jobs=len(closed))
+                checked += len(group)
+                emit("fetched", new=len(new), closed=len(closed), total=len(kept),
+                     skipped=len(fresh), batch=k, batches=prog["batches"],
+                     checked=checked, due=len(entries))
+                saved.set()
+
+            # One click walks every company. Every fetch slot stays busy for the
+            # whole scan, fast and slow sites in their own queues (fetch_boards),
+            # and saving a group overlaps fetching the next.
+            group = []
+            lanes: dict = {}
+            boards = fetch_boards(entries, c, s, lanes)
+            try:
+                for entry, jobs, err in boards:
+                    if not group:
+                        begin()
+                    group.append((entry, jobs, err))
+                    emit("fetch", company=entry["name"], count=len(jobs), error=err or "")
+                    if len(group) == size:
+                        save(group)
+                        group = []
+            finally:
+                boards.close()            # a failed scan stops the queued reads at once
+            if group or not entries:
+                if not entries:
+                    begin()
+                save(group)
+
+            fetched_all.set()
+            saved.set()
+            if scoring is not None:
+                scoring.join()
+            emit("lanes", fast=lanes.get("fast", 0), slow=lanes.get("slow", 0) + lanes.get("moved", 0),
+                 moved=lanes.get("moved", 0))
+            emit("details", line=report.line(), **report.summary())
+            print(f"scan: {report.line()}", flush=True)
+            emit("done", scored=prog["scored"], elapsed=round(time.time() - started, 1))
         except Exception as e:  # noqa: BLE001 - always close the stream cleanly
+            halt.set()
             emit("error", message=f"{type(e).__name__}: {e}"[:300])
         finally:
+            fetched_all.set()
+            saved.set()
+            if scoring is not None:
+                scoring.join()
             if crawl is not None:
                 s.finish_crawl(crawl)
             with _lock:

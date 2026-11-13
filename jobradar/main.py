@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import sys
 import time
 from pathlib import Path
@@ -19,12 +19,15 @@ from pathlib import Path
 import yaml
 
 from . import alerts as alerts_mod
+from . import details
 from . import digest as digest_mod
+from . import net
+from . import skillmatch
 from . import sources
 from .budget import Budget
 from .cursor import CursorError
 from .llm import RateLimited, make_scorer
-from .experience import experience_label, too_senior
+from .experience import job_years, too_senior
 from .localmatch import LocalScorer
 from .resume import build_profile, extract_text
 from .relevance import apply_cap as apply_relevance_cap
@@ -108,54 +111,80 @@ def _resume_profile(cfg: dict, scorer, force: bool = False) -> str:
     return profile
 
 
-def select_jobs(all_jobs: list[dict], cfg: dict, store: Store, days: int = 0) -> list[dict]:
-    """Apply the filters, reading full descriptions where a board lists none.
+def details_report(cfg: dict) -> details.Report:
+    """A scan's record of the postings it read, holding its allowance of
+    headless-browser renders (config `details:`)."""
+    d = cfg.get("details") or {}
+    return details.Report(browser_max=int(d.get("browser_max", 25)) if d.get("browser", True) else 0)
+
+
+def select_jobs(all_jobs: list[dict], cfg: dict, store: Store, days: int = 0,
+                report: details.Report | None = None) -> list[dict]:
+    """Apply the filters, reading each new posting in full.
 
     Cheap checks (title, location) run first. Then every NEW survivor whose
-    board gave no description - Workday and Oracle list endpoints never do -
-    has its detail page read, so the experience gate sees "3+ years" instead
-    of nothing. Jobs already stored were vetted when first seen, so a repeat
-    run only pays for postings that are actually new."""
+    board's list is only a title or a summary - Workday, Oracle, Greenhouse,
+    a careers page - has its posting read (details/): its full text, so the
+    experience gate sees "3+ years" instead of nothing, and what it states as
+    data - dates, work mode, employment type, salary, skills. Jobs already
+    stored were vetted when first seen, so a repeat run only pays for
+    postings that are actually new."""
     f = cfg.get("filters", {})
     cheap = [j for j in all_jobs if passes_filters(j, f, check_experience=False)]
+    known = store.known_ids()
     # Posting date first: a NEW job posted before the range (the Scan's time
     # range, else expire_after_days) is never a fit, so it is dropped before
     # its page is read. Jobs already saved stay, so none of them looks closed.
     limit = days or float(cfg.get("expire_after_days", 0) or 0)
-    if limit:
-        known_now = store.known_ids()
-        since = time.time() - limit * 86400
-        cheap = [j for j in cheap if j["id"] in known_now or not j.get("posted_at")
-                 or j["posted_at"] >= since]
-    if f.get("max_required_years") is not None:
-        known = store.known_ids()
-        # A job seen before is judged on the full description saved for it,
-        # not the one-line summary its board's list gives.
-        saved = store.descriptions([j["id"] for j in cheap if j["id"] in known])
-        for j in cheap:
-            if len(saved.get(j["id"]) or "") > len(j.get("description") or ""):
-                j["description"] = saved[j["id"]]
-        # Every new job whose board gave only a summary has its own page read,
-        # on every board - "5+ years" is usually half way down.
-        need = [j for j in cheap if j["id"] not in known
-                and (len(j.get("description") or "") < 300 or "gh_jid=" in (j.get("url") or "")
-                     or not j.get("posted_at"))]
-        if need:
-            with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
-                for job, text in zip(need, pool.map(sources.fetch_details, need)):
-                    if text and len(text) > len(job.get("description") or ""):
-                        job["description"] = text
-                    if text and not job.get("posted_at"):
-                        # the job's own page often dates it where the list did not
-                        job["posted_at"] = sources.posted_from_text(text)
-        if limit:
-            cheap = [j for j in cheap if j["id"] in known_now or not j.get("posted_at")
-                     or j["posted_at"] >= since]
-    kept = [j for j in cheap if not too_senior(j, f.get("max_required_years"))]
-    for j in kept:
-        j["experience"] = experience_label(j["title"], j.get("description") or "")
-        j.update(classify(j["title"], f.get("roles")) or {})
+    since = time.time() - limit * 86400
+
+    def in_range(j: dict) -> bool:
+        return not limit or j["id"] in known or not j.get("posted_at") or j["posted_at"] >= since
+    cheap = [j for j in cheap if in_range(j)]
+    # A job seen before is judged on the full description saved for it, not
+    # the one-line summary its board's list gives.
+    saved = store.descriptions([j["id"] for j in cheap if j["id"] in known])
+    for j in cheap:
+        if len(saved.get(j["id"]) or "") > len(j.get("description") or ""):
+            j["description"] = saved[j["id"]]
+    new = [j for j in cheap if j["id"] not in known]
+    need = [j for j in new if details.needs_page(j)]
+    if need:
+        report = report if report is not None else details_report(cfg)
+        with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
+            for job, found in zip(need, pool.map(lambda j: details.read(j, report), need)):
+                details.apply(job, found)
+    for j in new:
+        details.complete(j)
+    # The posting's own date can put it out of range; a posting whose
+    # applications have closed is not a job.
+    now = time.time()
+    cheap = [j for j in cheap if in_range(j) and not (j.get("closes_at") and j["closes_at"] < now)]
+    kept = []
+    for j in cheap:
+        if too_senior(j, f.get("max_required_years")):
+            continue
+        # A title that names no role got this far only as a skill-match
+        # candidate; now that its posting is read, it stays if it asks for
+        # enough of your skills.
+        role = job_role(j, cfg) if f.get("roles") else {}
+        if role is None:
+            continue
+        j["experience"] = details.years_label(job_years(j))
+        j.update(role)
+        kept.append(j)
     return kept
+
+
+def job_role(job: dict, cfg: dict) -> dict | None:
+    """The job's role: the first role its title names, else the skill-match
+    role when its posting names enough of your top skills (skillmatch.py)."""
+    f = cfg.get("filters", {})
+    got = classify(job["title"], f.get("roles"))
+    if got:
+        return got
+    sm = skillmatch.settings(f)
+    return skillmatch.role(job, sm, skillmatch.wanted_skills(cfg, sm))
 
 
 def is_blocked(company: str, blocked: list[str] | None) -> bool:
@@ -169,8 +198,11 @@ def passes_filters(job: dict, f: dict, check_experience: bool = True) -> bool:
     if is_blocked(job.get("company", ""), f.get("blocked_companies")):
         return False
     title = job["title"].lower()
-    # Configured roles replace the plain title_include list.
-    if f.get("roles") and classify(job["title"], f["roles"]) is None:
+    # Configured roles replace the plain title_include list. A title naming no
+    # role may still be a skill-match candidate; its posting decides later
+    # (job_role), once the full description has been read.
+    if (f.get("roles") and classify(job["title"], f["roles"]) is None
+            and not skillmatch.is_candidate(job["title"], skillmatch.settings(f))):
         return False
     inc = [] if f.get("roles") else [s.lower() for s in f.get("title_include") or []]
     exc = [s.lower() for s in f.get("title_exclude") or []]
@@ -222,6 +254,63 @@ def boards_due(cfg: dict, store: Store, fresh: set[str], full: bool = False,
     return sorted(entries, key=lambda e: ages.get(e["name"], 0))[:cap]
 
 
+def _timed_out(err: str | None) -> bool:
+    return bool(err and re.search(r"timeout|timed out", err, re.I))
+
+
+def fetch_boards(entries: list[dict], cfg: dict, store: Store, lanes: dict | None = None):
+    """Read every board; yield (entry, jobs, error) as each one finishes.
+
+    Two queues, so a slow careers site never holds up a fast one:
+      fast  most of the workers (fetch_concurrency less slow_concurrency),
+            each request given fast_timeout seconds and no second try
+      slow  a few workers with the full timeout and its retry; boards that
+            took slow_after_secs or more last time start here, and a board
+            that times out in the fast queue is handed here to try again
+    Each board's read time is saved, so the next scan sorts it straight
+    into the right queue. `lanes`, when given, gets the counts."""
+    workers = max(2, int(cfg.get("fetch_concurrency", 10)))
+    slow_workers = min(workers - 1, max(1, int(cfg.get("slow_concurrency", max(2, workers // 4)))))
+    cutoff = float(cfg.get("slow_after_secs", 8))
+    known = store.board_speeds()
+    secs: dict[str, float] = {}
+    stats = lanes if lanes is not None else {}
+    stats.update(fast=0, slow=0, moved=0)
+
+    def read(entry: dict):
+        t = time.time()
+        jobs, err = sources.fetch_company(entry)
+        return entry, jobs, err, time.time() - t
+
+    fast = ThreadPoolExecutor(workers - slow_workers, initializer=net.set_timeout,
+                              initargs=(float(cfg.get("fast_timeout", 8)),), thread_name_prefix="fast")
+    slow = ThreadPoolExecutor(slow_workers, initializer=net.set_timeout,
+                              initargs=(net.TIMEOUT,), thread_name_prefix="slow")
+    pending = {}
+    try:
+        for e in entries:
+            lane = "slow" if known.get(e["name"], 0) >= cutoff else "fast"
+            pending[(slow if lane == "slow" else fast).submit(read, e)] = lane
+            stats[lane] += 1
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                lane = pending.pop(fut)
+                entry, jobs, err, took = fut.result()
+                secs[entry["name"]] = secs.get(entry["name"], 0) + took
+                if lane == "fast" and _timed_out(err):
+                    pending[slow.submit(read, entry)] = "slow"
+                    stats["moved"] += 1
+                    continue
+                yield entry, jobs, err
+    finally:
+        # a scan that stopped early does not wait for the boards still queued
+        fast.shutdown(wait=False, cancel_futures=True)
+        slow.shutdown(wait=False, cancel_futures=True)
+        if secs:
+            store.save_board_speeds(secs)
+
+
 def start_crawl(cfg: dict, store: Store, source: str, fresh: set[str],
                 entries: list[dict]) -> int:
     """Open this crawl's row in the crawl history the web UI shows."""
@@ -240,6 +329,7 @@ def cmd_scan_batched(cfg: dict, store: Store, size: int, full: bool = False,
     batches = [entries[i:i + size] for i in range(0, len(entries), size)] or [[]]
     total = {"new": 0, "closed": 0, "errors": []}
     crawl = start_crawl(cfg, store, "scan", fresh, entries)
+    report = details_report(cfg)
     try:
         for k, chunk in enumerate(batches, 1):
             if not quiet:
@@ -247,7 +337,7 @@ def cmd_scan_batched(cfg: dict, store: Store, size: int, full: bool = False,
                       f"({chunk[0]['name'] if chunk else '-'} ... "
                       f"{chunk[-1]['name'] if chunk else '-'})", flush=True)
             got = cmd_scan(cfg, store, quiet=quiet, full=full, entries=chunk,
-                           discovery=(k == 1), crawl_id=crawl)
+                           discovery=(k == 1), crawl_id=crawl, report=report)
             for key in ("new", "closed"):
                 total[key] += got[key]
             total["errors"] += got["errors"]
@@ -255,13 +345,14 @@ def cmd_scan_batched(cfg: dict, store: Store, size: int, full: bool = False,
         store.finish_crawl(crawl)
     if not quiet:
         print(f"\nall batches: {total['new']} new jobs, {total['closed']} closed, "
-              f"{len(total['errors'])} errors", flush=True)
+              f"{len(total['errors'])} errors\n{report.line()}", flush=True)
     return total
 
 
 def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False,
              entries: list[dict] | None = None, discovery: bool = True,
-             crawl_id: int | None = None, source: str = "scan") -> dict:
+             crawl_id: int | None = None, source: str = "scan",
+             report: details.Report | None = None) -> dict:
     """Read the due boards, save what passes the filters and score it. Called
     without `entries` it is a whole crawl and records its own crawl row;
     cmd_scan_batched passes each batch plus the crawl it belongs to."""
@@ -284,10 +375,15 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False,
               f"(scan --full to read them anyway)", flush=True)
 
     # Boards are independent and fetching is network-bound, so fetch them in
-    # parallel. map() keeps config order for the printout; fetch_company never
-    # raises, so one dead board cannot take down the pool.
-    with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
-        fetched = list(pool.map(sources.fetch_company, entries))
+    # parallel, fast and slow sites in their own queues (fetch_boards). The
+    # printout keeps config order; fetch_company never raises, so one dead
+    # board cannot take down the run.
+    lanes: dict = {}
+    got = {e["name"]: (jobs, err) for e, jobs, err in fetch_boards(entries, cfg, store, lanes)}
+    fetched = [got[e["name"]] for e in entries]
+    if lanes["slow"] + lanes["moved"] and not quiet:
+        print(f"  slow queue: {lanes['slow'] + lanes['moved']} boards "
+              f"({lanes['moved']} moved from the fast queue)", flush=True)
 
     for entry, (jobs, err) in zip(entries, fetched):
         if err:
@@ -307,7 +403,11 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False,
         if not quiet:
             print(f"  {'discovery':<20} {len(jobs):>4} found")
 
-    kept = select_jobs(all_jobs, cfg, store)
+    own_report = report is None
+    report = details_report(cfg) if own_report else report
+    kept = select_jobs(all_jobs, cfg, store, report=report)
+    if own_report and not quiet:
+        print(f"  {report.line()}", flush=True)
     # keep descriptions around for scoring, keyed by id
     desc = {j["id"]: j["description"] for j in kept}
 
@@ -656,20 +756,27 @@ def cmd_recheck(cfg: dict, store: Store) -> None:
     Local only - no tokens."""
     f = cfg.get("filters", {})
     rows = [dict(r) for r in store.db.execute("SELECT * FROM jobs WHERE closed_at IS NULL")]
-    need = [j for j in rows if j["source"] in sources.DETAILS]
+    need = [j for j in rows if j["source"] in details.SUMMARY_ONLY or len(j["description"] or "") < 300]
+    report = details_report(cfg)
     with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
-        for job, text in zip(need, pool.map(sources.fetch_details, need)):
-            if text:
-                job["description"] = text
+        for job, found in zip(need, pool.map(lambda j: details.read(j, report), need)):
+            details.apply(job, found)
+    print(report.line())
     now = time.time()
     closed = 0
     for j in rows:
+        # skills saved before stay: some came from the board's own list (Keka)
+        j.setdefault("board_skills", [s for s in (j.get("skills") or "").split(", ") if s])
+        details.complete(j)
+        store.save_facts(j, commit=False)
+        role = None
         if passes_filters(j, f):
-            role = classify(j["title"], f.get("roles")) or {}
+            role = job_role(j, cfg) if f.get("roles") else {}
+        if role is not None:
             store.db.execute(
                 "UPDATE jobs SET experience = ?, role = ?, role_rank = ?, role_bonus = ? "
                 "WHERE id = ?",
-                (experience_label(j["title"], j["description"] or ""), role.get("role"),
+                (details.years_label(job_years(j)), role.get("role"),
                  role.get("role_rank"), role.get("role_bonus", 0), j["id"]))
         else:
             store.db.execute("UPDATE jobs SET closed_at = ? WHERE id = ?", (now, j["id"]))
