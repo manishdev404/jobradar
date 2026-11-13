@@ -42,10 +42,7 @@
     <select id="co" class="sel" title="Company"><option value="">all companies</option></select>
     <select id="rolefilter" class="sel" title="Role">
       <option value="">all roles</option>
-      <option>Backend</option>
-      <option>Full stack</option>
-      <option>Software engineer</option>
-      <option>Frontend</option>
+      <!-- one option per role found in the jobs, filled in by app.js (fillRoles) -->
     </select>
     <select id="stfilter" class="sel" title="Application status">
       <option value="">any status</option>
@@ -69,6 +66,7 @@
     <option value="1">the last 24 hours</option>
     <option value="3">the last 3 days</option>
     <option value="7">the last 7 days</option>
+    <option value="15">the last 15 days</option>
     <option value="30">the last 30 days</option>
   </select>
   <button id="scan" class="scanbtn">Scan</button>

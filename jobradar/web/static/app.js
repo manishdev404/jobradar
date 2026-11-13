@@ -42,7 +42,8 @@ function makeTile(job) {
   el.className = "tile " + bucket(job.score) + (selectedId === job.id ? " sel" : "");
   el.title = `${job.title} — ${job.company}` + (job.score !== null ? ` · ${job.score}/10` : "") +
     (job.app_status ? ` · ${STATUS_LABEL[job.app_status] || job.app_status}` : "") +
-    (job.role ? ` · ${job.role}` : "") + (job.experience ? ` · exp: ${job.experience}` : "");
+    (job.role ? ` · ${job.role}` : "") + (job.experience ? ` · exp: ${job.experience}` : "") +
+    (job.work_mode ? ` · ${WORK_LABEL[job.work_mode] || job.work_mode}` : "");
   if (job.app_status && job.app_status !== "not_applied") el.dataset.st = job.app_status;
   attachLogo(el, job);
   el.onclick = () => selectJob(job);
@@ -60,6 +61,42 @@ const STATUS_LABEL = {
   expired: "Expired", withdrawn: "Withdrawn", over_exp: "Over exp",
 };
 let selectedId = null;
+
+const WORK_LABEL = { remote: "Remote", hybrid: "Hybrid", onsite: "On-site" };
+const TYPE_LABEL = { "full-time": "Full-time", "part-time": "Part-time", contract: "Contract",
+  temporary: "Temporary", internship: "Internship" };
+
+function dayLabel(ts) {
+  return new Date(ts * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+// Saved as "Node.js, React"; a fresh scan event may carry a list.
+function splitSkills(v) {
+  if (Array.isArray(v)) return v;
+  return (v || "").split(", ").filter(Boolean);
+}
+
+// A posting's skills, marked by whether your resume names them.
+function skillRow(label, names, must) {
+  const row = document.createElement("div");
+  row.className = "sj-skills";
+  const have = names.filter((n) => mySkills.has(n.toLowerCase())).length;
+  const head = document.createElement("div");
+  head.className = "sj-meta";
+  head.textContent = must && mySkills.size ? `${label} · ${have} of ${names.length} on your resume` : label;
+  const chips = document.createElement("div");
+  chips.className = "skills";
+  for (const n of names) {
+    const chip = document.createElement("span");
+    const yours = mySkills.has(n.toLowerCase());
+    chip.className = "sk " + (yours ? "good" : must ? "missing" : "listed");
+    chip.title = yours ? "on your resume" : "not on your resume";
+    chip.textContent = n;
+    chips.appendChild(chip);
+  }
+  row.append(head, chips);
+  return row;
+}
 
 function statusSelect(current, onChange) {
   const sel = document.createElement("select");
@@ -94,6 +131,21 @@ function selectJob(job) {
   exp.className = "sj-meta";
   exp.textContent = `Role: ${job.role || "—"} · Experience asked: ${job.experience || "not stated"}`;
   box.append(title, meta, exp);
+  // What the posting states as data (details/): work mode, type, pay, dates.
+  const facts = [WORK_LABEL[job.work_mode], TYPE_LABEL[job.employment_type], job.salary,
+    job.closes_at ? `applications close ${dayLabel(job.closes_at)}` : "",
+    // an evergreen posting: re-dated by edits, first put up long ago
+    job.first_posted && (job.posted_at || 0) - job.first_posted > 30 * 86400
+      ? `first posted ${dayLabel(job.first_posted)}` : ""].filter(Boolean);
+  if (facts.length) {
+    const f = document.createElement("div");
+    f.className = "sj-meta sj-facts";
+    f.textContent = facts.join(" · ");
+    box.appendChild(f);
+  }
+  const must = splitSkills(job.skills), nice = splitSkills(job.skills_nice);
+  if (must.length) box.appendChild(skillRow("Must have", must, true));
+  if (nice.length) box.appendChild(skillRow("Nice to have", nice, false));
   if (job.reason) {
     const why = document.createElement("div");
     why.className = "sj-reason"; why.textContent = job.reason;
@@ -326,6 +378,26 @@ function fillCompanies() {
   sel.value = chosen;
 }
 
+// Role names come from the jobs themselves (config.yaml filters.roles plus
+// "Skill match"), so the list never drifts from what is stored. Ordered by
+// role priority, as in the grid.
+function fillRoles() {
+  const sel = $("rolefilter");
+  const chosen = sel.value;
+  const rank = {};
+  for (const j of jobs) if (j.role) rank[j.role] = Math.min(rank[j.role] ?? 99, j.role_rank || 9);
+  sel.textContent = "";
+  const all = document.createElement("option");
+  all.value = ""; all.textContent = "all roles";
+  sel.appendChild(all);
+  for (const n of Object.keys(rank).sort((a, b) => rank[a] - rank[b] || a.localeCompare(b))) {
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n;
+    sel.appendChild(o);
+  }
+  sel.value = [...sel.options].some((o) => o.value === chosen) ? chosen : "";
+}
+
 let debounce = null;
 function onFilterChange() {
   clearTimeout(debounce);
@@ -466,6 +538,7 @@ async function loadState() {
   jobs = d.jobs;
   scoringOn = d.scoring !== false;
   fillCompanies();
+  fillRoles();
   renderGrid(); renderStats(d.stats); renderTops(); renderCrawls(d.crawls || []);
   if (!selectedId) renderChecks(jobs.find((j) => j.score !== null) || null);
   // A scan started elsewhere (another tab, the scheduler, before a reload):
@@ -514,6 +587,7 @@ async function loadProfile() {
 
 // Resume skills, most done first (skill.py), then per track what the collected
 // jobs ask for that the resume only lists or lacks.
+let mySkills = new Set();   // lower-cased names, to mark a job's skills you have
 async function loadSkills() {
   const d = await fetch("/api/skills").then((r) => r.json());
   const box = $("skills");
@@ -521,6 +595,7 @@ async function loadSkills() {
     box.innerHTML = `<span class="muted">${escapeHtml(d.error || "no skills found on the resume")}</span>`;
     return;
   }
+  mySkills = new Set(d.skills.map((s) => s.name.toLowerCase()));
   box.innerHTML = d.skills.map((s) =>
     `<span class="sk ${s.tier}" title="${escapeHtml(s.category)} · work ${s.work} · projects ${s.projects}` +
     `${s.listed ? " · listed" : ""} · ${s.rating ? `your rating ${s.rating}/10` : `score ${s.score}`}">${escapeHtml(s.name)}</span>`).join("");
@@ -638,6 +713,14 @@ function startScan() {
         would_hire: scored.filter((x) => x.score >= 6).length,
         avg: scored.length ? scored.reduce((a, b) => a + b.score, 0) / scored.length / 10 : 0,
       });
+    } else if (d.type === "lanes") {
+      // slow careers sites read in their own queue, so the fast ones never wait
+      if (d.slow) $("bb-kept").textContent += ` · slow queue: ${d.slow} sites` +
+        (d.moved ? ` (${d.moved} timed out in the fast queue)` : "");
+    } else if (d.type === "details") {
+      // what reading the postings themselves found, per board
+      $("bb-range").textContent = `· ${d.line}`;
+      $("bb-range").title = (d.errors || []).map(([why, n]) => `${why} ×${n}`).join("\n");
     } else if (d.type === "throttled") {
       $("gridnote").textContent = `rate limited after ${d.scored} — press Scan again to continue`;
     } else if (d.type === "error") {
