@@ -2,13 +2,14 @@ const $ = (id) => document.getElementById(id);
 
 const STATUS_LABEL = {
   not_applied: "Not applied", queued: "In apply queue", applying: "AI applying",
-  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process", referral: "Referral",
+  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process",
+  referral_asked: "Asked for referral", referral_got: "Got referral",
   applied: "Applied", ai_applied: "AI apply done", contacted: "Contacted", assessment: "Assessment",
   interview: "Interview", offer: "Offer", rejected: "Rejected",
-  expired: "Expired", withdrawn: "Withdrawn",
+  expired: "Expired", withdrawn: "Withdrawn", over_exp: "Over exp",
 };
 // Counted as "applied" in the header: anything past the decision to apply.
-const APPLIED = new Set(["referral", "applied", "ai_applied", "contacted", "assessment", "interview",
+const APPLIED = new Set(["referral_got", "applied", "ai_applied", "contacted", "assessment", "interview",
                          "offer", "rejected", "expired", "withdrawn"]);
 
 let apps = [];

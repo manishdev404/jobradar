@@ -53,10 +53,11 @@ function makeTile(job) {
 // --- application status ------------------------------------------------------
 const STATUS_LABEL = {
   not_applied: "Not applied", queued: "In apply queue", applying: "AI applying",
-  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process", referral: "Referral",
+  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process",
+  referral_asked: "Asked for referral", referral_got: "Got referral",
   applied: "Applied", ai_applied: "AI apply done", contacted: "Contacted", assessment: "Assessment",
   interview: "Interview", offer: "Offer", rejected: "Rejected",
-  expired: "Expired", withdrawn: "Withdrawn",
+  expired: "Expired", withdrawn: "Withdrawn", over_exp: "Over exp",
 };
 let selectedId = null;
 
@@ -86,7 +87,8 @@ function selectJob(job) {
   const meta = document.createElement("div");
   meta.className = "sj-meta";
   meta.textContent = [job.company, job.location,
-    job.score !== null && job.score !== undefined ? `${job.score}/10` : "not scored yet"]
+    job.score !== null && job.score !== undefined ? `${job.score}/10` : "not scored yet",
+    postedLabel(job)]
     .filter(Boolean).join(" · ");
   const exp = document.createElement("div");
   exp.className = "sj-meta";
@@ -103,12 +105,21 @@ function selectJob(job) {
   saved.className = "sj-saved";
   const sel = statusSelect(job.app_status, async (status) => {
     saved.textContent = "saving…";
+    const send = () => fetch(`/api/jobs/${encodeURIComponent(job.id)}/status`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
     try {
-      const r = await fetch(`/api/jobs/${encodeURIComponent(job.id)}/status`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
-      });
-      if (!r.ok) throw new Error((await r.json()).detail || r.status);
+      let r;
+      try {
+        r = await send();
+      } catch {               // network blip: one retry before giving up
+        await new Promise((ok) => setTimeout(ok, 1500));
+        try { r = await send(); } catch {
+          throw new Error("the Job Radar server is not running - start it with .\\start, then try again");
+        }
+      }
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `server error ${r.status}`);
       job.app_status = status;
       saved.textContent = "saved to history";
       renderGrid();
@@ -124,14 +135,14 @@ function selectJob(job) {
   q.type = "button"; q.className = "sj-queue";
   q.textContent = inQueue ? "In apply queue" : "Add to apply queue";
   q.disabled = inQueue || applied;
-  q.title = applied ? "already applied" : "the AI engine will apply to it - see Apply status";
+  q.title = applied ? "already applied" : "the AI engine will apply to it - see Job apply queue";
   q.onclick = async () => {
     q.disabled = true;
     const d = await queueJobs([job.id]);
     if (d.added.length) {
       job.app_status = "queued"; sel.value = "queued";
       q.textContent = "In apply queue";
-      saved.textContent = "added - open Apply status to start";
+      saved.textContent = "added - open Job apply queue to start";
       renderGrid();
     } else {
       q.disabled = false;
@@ -150,30 +161,16 @@ function selectJob(job) {
 }
 
 async function queueJobs(ids) {
-  const r = await fetch("/api/apply/queue", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ job_ids: ids }),
-  });
-  return r.ok ? r.json() : { added: [], refused: [{ why: `error ${r.status}` }] };
-}
-
-// Every job the filters show that has no application yet goes to the queue.
-async function queueShown() {
-  const f = currentFilter();
-  const ids = jobs.filter((j) => matches(j, f) && statusMatches(j, "none")).map((j) => j.id);
-  if (!ids.length) { alert("No unapplied jobs match the filters."); return; }
-  if (!confirm(`Add ${ids.length} job(s) to the AI apply queue?\n` +
-               "Jobs below your minimum match score are skipped.")) return;
-  const d = await queueJobs(ids);
-  const why = {};                 // "match 3/10 is below 5" x 12, not twelve lines
-  for (const x of d.refused) {
-    const k = x.why.replace(/[\d.]+\/10/, "N/10");
-    why[k] = (why[k] || 0) + 1;
+  let r;
+  try {
+    r = await fetch("/api/apply/queue", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_ids: ids }),
+    });
+  } catch {
+    return { added: [], refused: ids.map(() => ({ why: "the Job Radar server is not running" })) };
   }
-  alert(`${d.added.length} added to the apply queue.` +
-        (d.refused.length ? `\n${d.refused.length} not added:\n` +
-          Object.entries(why).map(([w, n]) => `  ${n} × ${w}`).join("\n") : ""));
-  await loadState();
+  return r.ok ? r.json() : { added: [], refused: [{ why: `server error ${r.status}` }] };
 }
 
 function addInitial(el, company) {
@@ -189,6 +186,7 @@ const WEEK = 7 * 24 * 3600;
 function currentFilter() {
   return {
     q: ($("q").value || "").trim().toLowerCase(),
+    days: Number($("posted").value || 0),
     min: Number($("minscore").value || 0),
     company: $("co").value || "",
     newOnly: $("newonly").checked,
@@ -210,7 +208,21 @@ function statusMatches(job, want) {
 // null means "no query running", not "nothing matched".
 let searchIds = null;
 
+// When the job went up, by the job site. No date known: 0, so a time range
+// never lets it in on "first seen" - a 9-month-old repost is not new.
+const postedAt = (job) => job.posted_at || 0;
+
+function postedLabel(job) {
+  const t = postedAt(job);
+  if (!t) return "posting date unknown";
+  const days = Math.floor((Date.now() / 1000 - t) / 86400);
+  const when = days < 1 ? "today" : days === 1 ? "1 day ago" : `${days} days ago`;
+  return `posted ${when}`;
+}
+
 function matches(job, f) {
+  // posting age first: everything else only looks at jobs inside the range
+  if (f.days && Date.now() / 1000 - postedAt(job) > f.days * 86400) return false;
   if (f.company && job.company !== f.company) return false;
   if (f.min && (job.score === null || job.score === undefined || job.score < f.min)) return false;
   if (f.newOnly && (!job.first_seen || Date.now() / 1000 - job.first_seen > WEEK)) return false;
@@ -233,13 +245,51 @@ async function runSearch() {
   renderGrid();
 }
 
+// Dot colours on the tiles, grouped the way styles.css colours them.
+const STATUS_DOTS = [
+  ["var(--st-app)", ["queued", "applying", "contacted"]],
+  ["var(--st-proc)", ["in_process", "needs_you"]],
+  ["var(--st-ref-ask)", ["referral_asked"]],
+  ["var(--st-ref-got)", ["referral_got"]],
+  ["var(--st-good)", ["applied", "ai_applied", "assessment", "interview", "offer"]],
+  ["#e5484d", ["failed"]],
+  ["var(--st-bad)", ["rejected", "expired", "withdrawn", "over_exp"]],
+];
+
+function renderLegend() {
+  const counts = {};
+  for (const j of jobs) if (j.app_status) counts[j.app_status] = (counts[j.app_status] || 0) + 1;
+  $("stlegend").innerHTML = STATUS_DOTS.map(([color, sts]) => {
+    const n = sts.reduce((a, s) => a + (counts[s] || 0), 0);
+    const names = sts.map((s) => STATUS_LABEL[s] || s).join(" / ");
+    return `<span class="lg${n ? "" : " zero"}"><i style="background:${color}"></i>` +
+      `${escapeHtml(names)} <b>${n}</b></span>`;
+  }).join("");
+}
+
+// Grid order: jobs still to act on first; then, toward the bottom, in this
+// order: asked for referral, in process (with the stages after it), got
+// referral, applied, AI applied, expired, withdrawn, rejected, over experience. The server's
+// order (best first, mixed across companies) is kept inside each group.
+const GRID_GROUP = {
+  referral_asked: 1,
+  in_process: 2, contacted: 2, assessment: 2, interview: 2, offer: 2,
+  referral_got: 3, applied: 4, ai_applied: 5, expired: 6, withdrawn: 7, rejected: 8,
+  over_exp: 9,                          // asks for more experience: last of all
+};
+function gridGroup(job) {
+  return GRID_GROUP[job.app_status] || 0;      // not applied / AI queue: top
+}
+
 function renderGrid() {
+  renderLegend();
   const grid = $("grid");
   const f = currentFilter();
   grid.textContent = "";
   tiles.clear();
   let shown = 0;
-  for (const j of jobs) {
+  const ordered = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap((g) => jobs.filter((j) => gridGroup(j) === g));
+  for (const j of ordered) {
     if (!matches(j, f)) continue;
     const el = makeTile(j);
     tiles.set(j.id, el);
@@ -290,7 +340,10 @@ function renderStats(s) {
   // Only /api/state sends the company counts; scoring updates leave them be.
   if (s.crawled !== undefined) {
     $("s-crawled").textContent = s.crawled;
-    $("s-listed").textContent = s.listed;
+    $("s-indb").textContent = s.in_db;
+    $("s-companies").title = `${s.crawled} companies scanned out of ${s.in_db} in the DB. ` +
+      `${s.listed} have a job board Job Radar can read; the rest are kept with their ` +
+      `careers page only.`;
   }
 }
 
@@ -385,6 +438,28 @@ function escapeHtml(s) {
 let watching = false;      // true while this tab has the live scan stream open
 let pollTimer = null;
 
+// The time range is locked while a scan runs - in this tab, or one found
+// running after a reload (the server says which range it was started with).
+function lockRange(on, days, started) {
+  const sel = $("posted");
+  if (on && days !== undefined && days !== null) {
+    sel.value = String(days);
+    renderGrid();
+  }
+  sel.disabled = on;
+  const range = sel.options[sel.selectedIndex].text;
+  const since = started ? ` · started ${new Date(started * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
+  $("scanstatus").innerHTML = on
+    ? `Scanning jobs posted in <b>${escapeHtml(range)}</b>${since} · the range unlocks when the scan is done`
+    : "";
+}
+
+// Your last range comes back after a reload (only in this browser).
+try {
+  const saved = localStorage.getItem("jr-posted");
+  if (saved !== null && [...$("posted").options].some((o) => o.value === saved)) $("posted").value = saved;
+} catch { /* storage blocked: start at "any time" */ }
+
 async function loadState() {
   const r = await fetch("/api/state");
   const d = await r.json();
@@ -403,9 +478,11 @@ async function loadState() {
     $("bb-range").textContent = "· new jobs appear here batch by batch";
     $("bb-kept").textContent = `${jobs.length} jobs so far`;
     $("scan").disabled = true; $("scan").textContent = "Scanning…";
+    lockRange(true, d.scan_days, d.scan_started);
     pollTimer = setTimeout(loadState, 15000);
   } else if (!watching && $("scan").disabled) {
     $("scan").disabled = false; $("scan").textContent = "Scan";
+    lockRange(false);
     $("bb-label").textContent = "Scan complete";
     $("bb-range").textContent = "";
   }
@@ -489,7 +566,12 @@ function startScan() {
   }, 100);
 
   watching = true;
-  const es = new EventSource("/api/scan?limit=3000");
+  lockRange(true, undefined, Date.now() / 1000);
+  // full=true: a click reads every company, ignoring refresh_hours and
+  // boards_per_run, so new jobs at already-scanned companies are never missed.
+  // the "posted" filter: only jobs posted in that range are scored
+  // smart: every careers page, every time - companies with India tech jobs first
+  const es = new EventSource(`/api/scan?limit=3000&smart=true&days=${Number($("posted").value || 0)}`);
   batchNew = 0;
   $("bb-kept").textContent = "";
   let active = null;
@@ -569,6 +651,7 @@ function startScan() {
       clearLit();
       es.close(); clearInterval(timer); watching = false;
       btn.disabled = false; btn.textContent = "Scan";
+      lockRange(false);
       $("bb-label").textContent = "Scan complete";
       $("bb-fill").style.width = "100%";
       loadState();
@@ -578,6 +661,7 @@ function startScan() {
     clearLit();
     es.close(); clearInterval(timer); watching = false;
     btn.disabled = false; btn.textContent = "Scan";
+    lockRange(false);
     loadState();
   };
 }
@@ -627,12 +711,39 @@ function showMatchMade() {
   });
 }
 
+// Job apply queue opens as its own window on the right half of the screen; the
+// engine's Chrome window goes on the left half, so you can watch it and step in.
+function openApplyView(e) {
+  e.preventDefault();
+  const s = window.screen;
+  const half = Math.floor(s.availWidth / 2);
+  const left = (s.availLeft || 0) + half, top = s.availTop || 0;
+  const width = s.availWidth - half, height = s.availHeight;
+  const w = window.open("/apply", "jobradar-apply",
+                        `popup=yes,left=${left},top=${top},width=${width},height=${height}`);
+  if (!w) { location.href = "/apply"; return; }      // pop-ups blocked: same tab
+  try { w.moveTo(left, top); w.resizeTo(width, height); } catch { /* not ours to move */ }
+  w.focus();
+  fetch("/api/apply/arrange", { method: "POST" }).catch(() => {});
+}
+
+$("applylink").onclick = openApplyView;
 $("scan").onclick = startScan;
-$("queueshown").onclick = queueShown;
 $("q").addEventListener("input", onFilterChange);
 $("minscore").addEventListener("change", renderGrid);
 $("co").addEventListener("change", renderGrid);
 $("newonly").addEventListener("change", renderGrid);
+$("posted").addEventListener("change", () => {
+  try { localStorage.setItem("jr-posted", $("posted").value); } catch { /* not kept */ }
+  renderGrid();
+});
+// Every status is filterable, in pipeline order (STATUS_LABEL follows it).
+for (const [st, label] of Object.entries(STATUS_LABEL)) {
+  if (st === "not_applied") continue;               // that is "not applied yet"
+  const o = document.createElement("option");
+  o.value = st; o.textContent = label;
+  $("stfilter").appendChild(o);
+}
 $("stfilter").addEventListener("change", renderGrid);
 $("rolefilter").addEventListener("change", renderGrid);
 $("q").addEventListener("keydown", (e) => {

@@ -96,7 +96,7 @@ function renderWait(w) {
     opts.appendChild(b);
   }
   if (w.input) setTimeout(() => input.focus(), 50);
-  document.title = "● Needs you - Apply Status";
+  document.title = "● Needs you - Job Apply Queue";
 }
 
 function renderLog(log) {
@@ -180,7 +180,7 @@ async function refresh() {
   $("stop").textContent = eng.phase === "stopping" ? "Stopping…" : "Stop after this job";
   $("error").hidden = !eng.error;
   $("error").textContent = eng.error || "";
-  if (!eng.waiting) document.title = "Apply Status";
+  if (!eng.waiting) document.title = "Job Apply Queue";
   renderCurrent(eng);
   renderWait(eng.waiting);
   renderLog(eng.log || []);
