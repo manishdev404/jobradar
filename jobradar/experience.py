@@ -180,11 +180,26 @@ def experience_label(title: str, description: str) -> str:
     return "fresher (0 yrs)" if need == 0 else f"{need}+ yrs"
 
 
+def job_years(job: dict) -> int | None:
+    """Years a posting asks for. The board's own experience field wins when it
+    has one (Keka, Zoho, Darwinbox, a JSON-LD experienceRequirements);
+    otherwise the description is read - minus its nice-to-have and benefits
+    sections, whose figures are no bar ("Nice to have: 3+ years of Kubernetes").
+    A level in the title counts either way."""
+    stated = job.get("years_min")
+    if stated in (None, ""):
+        from .details.sections import without
+        text = without(_plain(job.get("description") or ""), {"nice", "benefits"})
+        return required_years(job.get("title", ""), text)
+    level = title_level_years(job.get("title", ""))
+    return max(int(stated), level) if level is not None else int(stated)
+
+
 def too_senior(job: dict, max_years: int | None) -> bool:
     """True when the posting's stated bar is above max_years."""
     if max_years is None:
         return False
-    need = required_years(job.get("title", ""), job.get("description", ""))
+    need = job_years(job)
     return need is not None and need > max_years
 
 

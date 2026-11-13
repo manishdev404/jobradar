@@ -523,6 +523,16 @@ def find_skills(text: str) -> set[str]:
         Tailwind CSS -> Tailwind CSS, not CSS
     """
 
+    return set(skills_in_order(text))
+
+
+def skills_in_order(text: str) -> list[str]:
+    """
+    Skill names in text, in the order they first appear.
+
+    A posting tends to list its must-haves first, so a cut list keeps them.
+    """
+
     spans = []
 
     for name, alias, pattern in _PATTERNS:
@@ -550,7 +560,7 @@ def find_skills(text: str) -> set[str]:
     )
 
     taken: list[tuple[int, int]] = []
-    found = set()
+    first: dict[str, int] = {}
 
     for start, end, name in spans:
 
@@ -563,9 +573,9 @@ def find_skills(text: str) -> set[str]:
             continue
 
         taken.append((start, end))
-        found.add(name)
+        first[name] = min(first.get(name, start), start)
 
-    return found
+    return sorted(first, key=first.get)
 
 
 # ---------------------------------------------------------------------------

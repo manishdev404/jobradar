@@ -16,8 +16,10 @@ import re
 
 
 def _matches(title: str, words: list[str]) -> bool:
-    t = title.lower()
-    return any(re.search(rf"(?<![a-z]){re.escape(w.lower())}(?![a-z])", t) for w in words)
+    # Boards pad titles: "Software  Engineer" (two spaces) is a software engineer.
+    t = re.sub(r"\s+", " ", title.lower())
+    # A plural is the same role: "Node Js Developers", "Backend Engineers".
+    return any(re.search(rf"(?<![a-z]){re.escape(w.lower())}s?(?![a-z])", t) for w in words)
 
 
 def classify(title: str, roles: list[dict] | None) -> dict | None:

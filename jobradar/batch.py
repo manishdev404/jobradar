@@ -17,6 +17,10 @@ from __future__ import annotations
 import json
 import re
 
+from .details.facts import years_label
+from .experience import _plain, job_years
+from .skill import skills_in_order
+
 KEYS = ("skills", "seniority", "location", "domain", "recency", "reach")
 
 # Static across a whole run: identical bytes every batch, so it can be cached.
@@ -39,7 +43,8 @@ work.
 
 Reply with ONLY a JSON array of these arrays. No prose, no keys, no markdown."""
 
-USER = """Jobs, one per line as ref|company|title|location|description:
+USER = """Jobs, one per line as ref|company|title|location|experience asked|skills asked
+(a posting that names no skills shows its opening words instead):
 {jobs}"""
 
 
@@ -54,11 +59,30 @@ def build_messages(profile: str, jobs: list[dict]) -> list[dict]:
 def _job_lines(jobs: list[dict]) -> str:
     lines = []
     for i, j in enumerate(jobs):
-        # Title, company and location carry most of the signal; the opening of
-        # a description carries the rest.
-        desc = " ".join((j.get("description") or "")[:240].split())
-        lines.append(f"{i}|{j['company']}|{j['title']}|{j.get('location') or '?'}|{desc}")
+        where = j.get("location") or "?"
+        mode = j.get("work_mode") or ""
+        if mode in ("remote", "hybrid") and mode not in where.lower():
+            where = f"{where} ({mode})"
+        lines.append(f"{i}|{j['company']}|{j['title']}|{where}|{_asks(j)}")
     return "\n".join(lines)
+
+
+def _asks(job: dict) -> str:
+    """What the posting asks for, read here from the full page the scraper
+    saved instead of by the model: the years it wants and its must-have
+    skills, in page order. A description's opening is mostly about the
+    company - in four postings out of five it names no skill - so sending it
+    cost tokens and told the model little."""
+    text = " ".join(_plain(job.get("description") or "").split())
+    years = job.get("experience") or years_label(job_years(job))
+    skills = job.get("skills") or []
+    if isinstance(skills, str):                     # as saved: "Node.js, React"
+        skills = [s for s in skills.split(", ") if s]
+    skills = (skills or skills_in_order(text))[:15]
+    # A posting that names no skill sends its opening, so the model still has
+    # something to read beyond the title.
+    asks = ", ".join(skills) if skills else text[:160].replace("|", "/") or "?"
+    return f"{years}|{asks}"
 
 
 def build_prompt(profile: str, jobs: list[dict]) -> str:
