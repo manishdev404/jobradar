@@ -41,7 +41,10 @@ _BEFORE_NOISE = re.compile(
     re.I)
 # Whole words: "4-5 years\nBACKEND (Node.js)" is a requirement, not "years back".
 _AFTER_NOISE = re.compile(r"^\s*(back|ago|old|of (?:history|heritage|legacy|growth)|"
-                          r"degree|program|programme|course|contract|term|warranty)\b", re.I)
+                          r"degree|program|programme|course|contract|term|warranty)\b|"
+                          # "a 15 years full time education is required" is schooling -
+                          # no word end: boards glue it on ("educationSummary")
+                          r"^\s*(?:of\s+)?(?:full[- ]time\s+|regular\s+)?(?:education|schooling)", re.I)
 _MAX_PLAUSIBLE = 15   # "35 years of experience moving $16 trillion" is the company
 
 
@@ -113,6 +116,13 @@ _YEARS_AFTER = re.compile(
     r"(?!\s*(?:%|months?))",
     re.I,
 )
+# Keka and others print a bare field with no unit: "Experience: 5-6",
+# "Experience: 4 +", "Experience (in years): 3", "Experience: 01". The low end counts.
+_EXP_FIELD = re.compile(
+    rf"(?:^|\n)\s*(?:work\s+|total\s+|relevant\s+)?experience\s*(?:\((?:in\s+)?(?:years?|yrs?)\))?"
+    rf"\s*[:\-–—]\s*{_NUM}\s*(?:\+|(?:-|–|—|to)\s*\d{{1,2}})?\s*(?:\+)?\s*(?:years?|yrs?)?\s*(?=$|\n|[,.;])",
+    re.I,
+)
 
 
 def _clause(text: str, start: int, end: int) -> tuple[str, str]:
@@ -152,6 +162,11 @@ def _text_years(title: str, description: str) -> int | None:
         raw = m.group(1).lower()
         n = _WORDS[raw] if raw in _WORDS else int(raw)
         if n <= _MAX_PLAUSIBLE and not _is_optional(text, m.start(), m.end()):
+            stated.append(n)
+    for m in _EXP_FIELD.finditer(text):
+        raw = m.group(1).lower()
+        n = _WORDS[raw] if raw in _WORDS else int(raw)
+        if n <= _MAX_PLAUSIBLE:
             stated.append(n)
     found = stated or stray
     return max(found) if found else None

@@ -169,6 +169,7 @@ def apply_enqueue(body: QueueIn):
     """Add jobs to the apply queue. A job below min_match_score_to_apply, at a
     company in skip_companies, or already applied to is refused with why."""
     s, rules = store(), _apply_settings()
+    s.expire_old(float(cfg().get("expire_after_days", 45) or 0))   # old ones are refused as expired
     floor = rules.get("min_match_score_to_apply")
     skip = {c.lower() for c in rules.get("skip_companies") or []}
     added, refused = [], []
@@ -226,6 +227,12 @@ def apply_screen():
 @app.post("/api/apply/start")
 def apply_start():
     return {"started": engine().start()}
+
+
+@app.post("/api/apply/arrange")
+def apply_arrange():
+    """Put the engine's Chrome window on the left half of the screen."""
+    return {"placed": engine().place_left()}
 
 
 @app.post("/api/apply/stop")
@@ -302,7 +309,7 @@ def state():
     c, s = cfg(), store()
     rows = s.db.execute(
         """SELECT id, company, title, url, location, score, reason, domain, source,
-                  breakdown, first_seen, closed_at, experience, role, role_rank, role_bonus,
+                  breakdown, posted_at, first_seen, closed_at, experience, role, role_rank, role_bonus,
                   (SELECT a.status FROM applications a WHERE a.job_id = jobs.id
                    ORDER BY a.updated_at DESC LIMIT 1) AS app_status
            FROM jobs
@@ -312,8 +319,8 @@ def state():
     jobs = _mosaic([dict(r) for r in rows], limit=4000)
     scored = [j for j in jobs if j["score"] is not None]
     threshold = c.get("llm", {}).get("min_score", 6)
-    # Companies tile: boards read successfully out of every readable company,
-    # so the job count next to it is not mistaken for the crawl's reach.
+    # Companies tile: boards read successfully out of every company in the DB;
+    # its tooltip adds how many of those have a board Job Radar can read.
     listed = {e["name"] for e in c.get("companies", [])}
     read = listed & set(s.board_ages())
     return {
@@ -323,6 +330,7 @@ def state():
         "stats": {
             "crawled": len(read),
             "listed": len(listed),
+            "in_db": s.db.execute("SELECT COUNT(*) FROM companies").fetchone()[0],
             "checked": len(scored),
             "total": len(jobs),
             "closed": s.db.execute(
@@ -332,6 +340,8 @@ def state():
             "threshold": threshold,
         },
         "scanning": _state["scanning"],
+        "scan_days": _state.get("days", 0),
+        "scan_started": _state.get("started", 0),
         "scoring": c.get("llm", {}).get("provider", "none") not in ("none", None, ""),
     }
 
@@ -362,8 +372,10 @@ def _mosaic(jobs: list[dict], limit: int) -> list[dict]:
     return out
 
 
-def _scan_events(limit: int, full: bool = False):
-    """Generator of SSE events. Fetch first, then score, emitting per job."""
+def _scan_events(limit: int, full: bool = False, days: int = 0, smart: bool = False):
+    """Generator of SSE events. Fetch first, then score, emitting per job.
+    days: only jobs posted in the last `days` days are scored (the page's
+    "posted" filter); every job is still saved, so none looks closed."""
     c = cfg()
     started = time.time()
     q: queue.Queue = queue.Queue()
@@ -377,9 +389,10 @@ def _scan_events(limit: int, full: bool = False):
         s = store()
         crawl = None
         try:
-            # Same rules as cmd_scan: skip boards read within refresh_hours.
-            fresh = set() if full else s.fresh_boards(float(c.get("refresh_hours", 0) or 0))
-            entries = boards_due(c, s, fresh, full)
+            # Same rules as cmd_scan: skip boards read within refresh_hours,
+            # unless full (the web Scan button always asks for full).
+            fresh = set() if full or smart else s.fresh_boards(float(c.get("refresh_hours", 0) or 0))
+            entries = boards_due(c, s, fresh, full, smart=smart)
             crawl = start_crawl(c, s, "web", fresh, entries)
             checked = 0
             # One click walks every company in batches (scan_batch, default 50):
@@ -408,10 +421,11 @@ def _scan_events(limit: int, full: bool = False):
                     all_jobs.extend(jobs)
                     emit("fetch", company="discovery", count=len(jobs), error="")
 
-                kept = select_jobs(all_jobs, c, s)
+                kept = select_jobs(all_jobs, c, s, days)
                 desc = {j["id"]: j["description"] for j in kept}
                 new = s.upsert(kept)
                 closed = s.mark_closed(healthy)
+                s.expire_old(float(c.get("expire_after_days", 45) or 0))
                 for name in healthy:
                     s.mark_fetched(name, counts[name])
                 s.link_applications()
@@ -428,6 +442,9 @@ def _scan_events(limit: int, full: bool = False):
                     scorer = get_scorer(c)
                     prof = get_profile(c, scorer)
                 rows = s.unscored(limit)
+                if days:
+                    since = time.time() - days * 86400
+                    rows = [r for r in rows if (r["posted_at"] or 0) >= since]
                 emit("scoring", count=len(rows), backlog=s.unscored_count(), batch=k,
                      batches=len(batches))
 
@@ -487,6 +504,7 @@ def _scan_events(limit: int, full: bool = False):
             return
         _state["scanning"] = True
         _state["started"] = started
+        _state["days"] = days            # the page's time range, locked until done
 
     threading.Thread(target=work, daemon=True).start()
     while True:
@@ -522,9 +540,9 @@ def search(q: str = "", limit: int = 4000):
 
 
 @app.get("/api/scan")
-def scan(limit: int = 120, full: bool = False):
+def scan(limit: int = 120, full: bool = False, days: int = 0, smart: bool = False):
     return StreamingResponse(
-        _scan_events(limit, full),
+        _scan_events(limit, full, days, smart),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

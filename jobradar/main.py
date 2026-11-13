@@ -108,7 +108,7 @@ def _resume_profile(cfg: dict, scorer, force: bool = False) -> str:
     return profile
 
 
-def select_jobs(all_jobs: list[dict], cfg: dict, store: Store) -> list[dict]:
+def select_jobs(all_jobs: list[dict], cfg: dict, store: Store, days: int = 0) -> list[dict]:
     """Apply the filters, reading full descriptions where a board lists none.
 
     Cheap checks (title, location) run first. Then every NEW survivor whose
@@ -118,15 +118,39 @@ def select_jobs(all_jobs: list[dict], cfg: dict, store: Store) -> list[dict]:
     run only pays for postings that are actually new."""
     f = cfg.get("filters", {})
     cheap = [j for j in all_jobs if passes_filters(j, f, check_experience=False)]
+    # Posting date first: a NEW job posted before the range (the Scan's time
+    # range, else expire_after_days) is never a fit, so it is dropped before
+    # its page is read. Jobs already saved stay, so none of them looks closed.
+    limit = days or float(cfg.get("expire_after_days", 0) or 0)
+    if limit:
+        known_now = store.known_ids()
+        since = time.time() - limit * 86400
+        cheap = [j for j in cheap if j["id"] in known_now or not j.get("posted_at")
+                 or j["posted_at"] >= since]
     if f.get("max_required_years") is not None:
         known = store.known_ids()
-        need = [j for j in cheap if j["id"] not in known and j.get("source") in sources.DETAILS
-                and len(j.get("description") or "") < 300]
+        # A job seen before is judged on the full description saved for it,
+        # not the one-line summary its board's list gives.
+        saved = store.descriptions([j["id"] for j in cheap if j["id"] in known])
+        for j in cheap:
+            if len(saved.get(j["id"]) or "") > len(j.get("description") or ""):
+                j["description"] = saved[j["id"]]
+        # Every new job whose board gave only a summary has its own page read,
+        # on every board - "5+ years" is usually half way down.
+        need = [j for j in cheap if j["id"] not in known
+                and (len(j.get("description") or "") < 300 or "gh_jid=" in (j.get("url") or "")
+                     or not j.get("posted_at"))]
         if need:
             with ThreadPoolExecutor(max_workers=int(cfg.get("fetch_concurrency", 10))) as pool:
                 for job, text in zip(need, pool.map(sources.fetch_details, need)):
-                    if text:
+                    if text and len(text) > len(job.get("description") or ""):
                         job["description"] = text
+                    if text and not job.get("posted_at"):
+                        # the job's own page often dates it where the list did not
+                        job["posted_at"] = sources.posted_from_text(text)
+        if limit:
+            cheap = [j for j in cheap if j["id"] in known_now or not j.get("posted_at")
+                     or j["posted_at"] >= since]
     kept = [j for j in cheap if not too_senior(j, f.get("max_required_years"))]
     for j in kept:
         j["experience"] = experience_label(j["title"], j.get("description") or "")
@@ -155,6 +179,9 @@ def passes_filters(job: dict, f: dict, check_experience: bool = True) -> bool:
         return False
     if any(s in title for s in exc):
         return False
+    words = [s.lower() for s in f.get("title_exclude_words") or []]
+    if any(re.search(rf"\b{re.escape(w)}\b", title) for w in words):
+        return False
     # Whole words: "india" must not match "Indianapolis" or "Indiana".
     if locs and not any(re.search(rf"\b{re.escape(s)}\b", job["location"].lower()) for s in locs):
         return False
@@ -173,13 +200,21 @@ def passes_filters(job: dict, f: dict, check_experience: bool = True) -> bool:
 
 # ---------------------------------------------------------------------------
 
-def boards_due(cfg: dict, store: Store, fresh: set[str], full: bool = False) -> list[dict]:
+def boards_due(cfg: dict, store: Store, fresh: set[str], full: bool = False,
+               smart: bool = False) -> list[dict]:
     """Boards to read this run: not fresh, stalest first, at most boards_per_run.
     With a long company list this spreads the reading over several runs
-    instead of every board coming due in the same one."""
+    instead of every board coming due in the same one.
+
+    smart (the Scan button): EVERY careers page, every time - none is skipped
+    for having been read recently. Companies with India tech jobs go first,
+    so results show up sooner."""
     entries = [e for e in cfg.get("companies", [])
                if e["name"] not in fresh and not is_blocked(e["name"], cfg.get("filters", {})
                                                             .get("blocked_companies"))]
+    if smart:
+        active = store.active_companies()
+        return sorted(entries, key=lambda e: e["name"] not in active)
     cap = int(cfg.get("boards_per_run", 0) or 0)
     if full or not cap or len(entries) <= cap:
         return entries
@@ -278,7 +313,8 @@ def cmd_scan(cfg: dict, store: Store, quiet: bool = False, full: bool = False,
 
     new = store.upsert(kept)
     closed = store.mark_closed(healthy_companies)
-    counts = {e["name"]: len(j) for e, (j, err) in zip(entries, fetched) if not err}
+    store.expire_old(float(cfg.get("expire_after_days", 45) or 0))
+    counts ={e["name"]: len(j) for e, (j, err) in zip(entries, fetched) if not err}
     for name in healthy_companies:
         store.mark_fetched(name, counts.get(name, 0))
     store.add_to_crawl(crawl_id, ok=len(healthy_companies),
@@ -697,8 +733,12 @@ def main(argv=None) -> None:
     fb.add_argument("path", nargs="?")
     fb.add_argument("--disabled", action="store_true",
                     help="search again for companies whose board is gone or unreadable")
+    fb.add_argument("--pages", action="store_true",
+                    help="give every careers-page-only company a reader (a board found on its "
+                         "page, else the page itself) so a scan checks all of them")
     fb.add_argument("--workers", type=int, default=24, help="companies searched at once")
-    ap =sub.add_parser("applied", help="list your application history")
+    sub.add_parser("dataset", help="how much the AI apply engine has recorded to learn from")
+    ap = sub.add_parser("applied", help="list your application history")
     ap.add_argument("--status", default="", help="only this status, e.g. applied")
     d = sub.add_parser("digest"); d.add_argument("--days", type=int, default=7)
     d.add_argument("--new-only", action="store_true", help="email only new openings")
@@ -736,6 +776,13 @@ def main(argv=None) -> None:
         print(f"companies.json written ({store.export_companies(ROOT / 'companies.json')} companies).")
     elif args.cmd == "companies":
         cmd_companies(store)
+    elif args.cmd == "dataset":
+        from .apply.dataset import summary
+        d = summary(ROOT)
+        print(f"{d['applications']} applications recorded ({d['applied']} applied, {d['failed']} failed) "
+              f"on {d['sites']} sites: {d['pages']} form pages, {d['fields']} fields, "
+              f"{d['your_steps']} steps you did by hand.\n"
+              f"File: private/apply-dataset/applications.jsonl")
     elif args.cmd == "skills":
         from .skill import print_report, report_for
         print_report(report_for(ROOT, cfg, store))
@@ -748,8 +795,14 @@ def main(argv=None) -> None:
         cmd_companies(store)
     elif args.cmd == "find-boards":
         from . import discover
-        if not args.path and not args.disabled:
-            p.error("find-boards needs a file or --disabled")
+        if not args.path and not args.disabled and not args.pages:
+            p.error("find-boards needs a file, --disabled or --pages")
+        if args.pages:
+            got = discover.run_pages(store, args.workers)
+            n = store.export_companies(ROOT / "companies.json")
+            print(", ".join(f"{v} {k}" for k, v in got.items()) + f". companies.json rewritten ({n}).")
+            cmd_companies(store)
+            return
         got = (discover.run_file(Path(args.path), store, args.workers) if args.path
                else discover.run_disabled(store, args.workers))
         missing = got.pop("missing")
