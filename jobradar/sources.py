@@ -6,12 +6,18 @@ import html as html_mod
 import re
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
 import requests
 
-UA = {"User-Agent": "jobradar/0.1 (personal job tracker)"}
-TIMEOUT = 25
+from . import net
+from .details.dates import parse_date, posted_from_text  # noqa: F401 - posted_from_text is shared
+from .details.facts import board_skills, employment_word, money, years_from_field
+from .details.sites.ashby import from_posting as _ashby_posting
+from .details.sites.lever import from_posting as _lever_posting
+from .details.sites.zoho import from_record as _zoho_record
+
+UA = net.UA
+TIMEOUT = net.TIMEOUT
 
 
 def _job_id(company: str, title: str, url: str) -> str:
@@ -34,19 +40,9 @@ def _norm(company, title, url, location="", posted_at=None, description="", sour
 
 
 def _request(method: str, url: str, **kw) -> requests.Response:
-    """One retry on a connection failure. Hosts like Workday drop the odd
-    connection under a burst of parallel requests; a single retry after a pause
-    turns most of those into a normal fetch instead of a missing company."""
-    for attempt in (0, 1):
-        try:
-            r = requests.request(method, url, timeout=TIMEOUT, **kw)
-            r.raise_for_status()
-            return r
-        except (requests.ConnectionError, requests.Timeout):
-            if attempt:
-                raise
-            time.sleep(3)
-    raise AssertionError("unreachable")
+    """See net.request: pooled connections, one retry on a dropped
+    connection or a busy host."""
+    return net.request(method, url, **kw)
 
 
 def _get(url: str) -> Any:
@@ -54,44 +50,26 @@ def _get(url: str) -> Any:
 
 
 def _epoch(value) -> float | None:
-    """Boards return ms ints, ISO strings, or nothing. Normalize to epoch seconds."""
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        return value / 1000 if value > 1e11 else float(value)
-    try:
-        from datetime import datetime
-        s = str(value).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return None
+    """Boards return ms ints, ISO strings, RSS dates, "Nov 3, 2025" - or
+    nothing. Normalize to epoch seconds."""
+    return parse_date(value)
 
 
-_POSTED_ISO = re.compile(r"(?:date ?posted|posted(?: on)?|date opened)\s*[:\-]?\s*"
-                         r"(\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d\d:?\d\d)?)?)", re.I)
-_POSTED_AGO = re.compile(r"posted\s*[:\-]?\s*(?:on\s*)?(today|just now|yesterday|"
-                         r"(\d+)\+?\s*(minute|hour|day|week|month|year)s?\s*ago)", re.I)
-_UNIT = {"minute": 60, "hour": 3600, "day": 86400, "week": 7 * 86400,
-         "month": 30 * 86400, "year": 365 * 86400}
+def _facts(job: dict, **found) -> dict:
+    """Keep what a board's list states as data - work mode, employment type,
+    salary, experience, skills - on the job, so nothing has to guess it from
+    the description later."""
+    for key, value in found.items():
+        if value not in (None, "", []):
+            job[key] = value
+    return job
 
 
-def posted_from_text(text: str | None, now: float | None = None) -> float | None:
-    """When a posting went up, from words a board prints: "Posted 2 Days Ago",
-    "Posted 30+ Days Ago" (counted as 30: at least that old), "Posted: 9
-    months ago", "Date posted: 2025-12-17". None when it says nothing."""
-    text, now = text or "", now or time.time()
-    m = _POSTED_ISO.search(text)
-    if m:
-        return _epoch(m.group(1))
-    m = _POSTED_AGO.search(text)
-    if not m:
-        return None
-    word = m.group(1).lower()
-    if word in ("today", "just now"):
-        return now
-    if word == "yesterday":
-        return now - 86400
-    return now - int(m.group(2)) * _UNIT[m.group(3).lower()]
+def _with(job: dict, d) -> dict:
+    """A list item's facts, read by the same reader as the posting itself."""
+    return _facts(job, work_mode=d.work_mode, employment_type=d.employment_type, salary=d.salary,
+                  closes_at=d.closes_at, years_min=d.years_min, years_max=d.years_max,
+                  board_skills=d.skills)
 
 
 # --------------------------------------------------------------------------
@@ -101,7 +79,7 @@ def posted_from_text(text: str | None, now: float | None = None) -> float | None
 def greenhouse(name: str, slug: str) -> list[dict]:
     # The list is fetched WITHOUT content: with it, one big board is megabytes
     # per scan. The description of a job that survives the filters is fetched
-    # once, from `api`, by fetch_details.
+    # once, from `api`, by the posting reader (details/sites/greenhouse.py).
     data = _get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs")
     out = []
     for j in data.get("jobs", []):
@@ -117,25 +95,21 @@ def lever(name: str, slug: str) -> list[dict]:
     data = _get(f"https://api.lever.co/v0/postings/{slug}?mode=json")
     out = []
     for j in data:
-        cats = j.get("categories") or {}
-        # descriptionPlain is only the intro; requirements ("2+ years of...")
-        # live in `lists`, so include them or the experience gate is blind.
-        lists = " ".join(f"{x.get('text', '')}: {x.get('content', '')}"
-                         for x in (j.get("lists") or []))
-        desc = " ".join(p for p in (j.get("descriptionPlain", ""), lists,
-                                    j.get("additionalPlain", "")) if p)
-        out.append(_norm(name, j.get("text"), j.get("hostedUrl"),
-                         cats.get("location", ""), _epoch(j.get("createdAt")),
-                         desc, "lever"))
+        # Each item is the whole posting; its `lists` carry the requirements
+        # ("2+ years of..."), each under its own heading.
+        d = _lever_posting(j)
+        out.append(_with(_norm(name, j.get("text"), j.get("hostedUrl"), d.location, d.posted_at,
+                               d.text, "lever"), d))
     return out
 
 
 def ashby(name: str, slug: str) -> list[dict]:
-    data = _get(f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=false")
+    data = _get(f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true")
     out = []
     for j in data.get("jobs", []):
-        out.append(_norm(name, j.get("title"), j.get("jobUrl"), j.get("location", ""),
-                         _epoch(j.get("publishedAt")), j.get("descriptionPlain", ""), "ashby"))
+        d = _ashby_posting(j)
+        out.append(_with(_norm(name, j.get("title"), j.get("jobUrl"), j.get("location", ""),
+                               d.posted_at, d.text, "ashby"), d))
     return out
 
 
@@ -143,9 +117,11 @@ def workable(name: str, slug: str) -> list[dict]:
     data = _get(f"https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true")
     out = []
     for j in data.get("jobs", []):
-        out.append(_norm(name, j.get("title"), j.get("url" ) or j.get("application_url"),
-                         j.get("location", ""), _epoch(j.get("published_on")),
-                         j.get("description", ""), "workable"))
+        job = _norm(name, j.get("title"), j.get("url" ) or j.get("application_url"),
+                    j.get("location", ""), _epoch(j.get("published_on")),
+                    j.get("description", ""), "workable")
+        out.append(_facts(job, work_mode="remote" if j.get("telecommuting") else "",
+                          employment_type=employment_word(j.get("employment_type"))))
     return out
 
 
@@ -286,8 +262,7 @@ BOARDS.update({"workday": workday, "oracle": oracle_cloud, "atlassian": atlassia
 # jobs API, so these read what each careers page itself loads. Their pages
 # serve a stub to non-browser clients, hence the browser User-Agent.
 
-BROWSER = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"}
+BROWSER = net.BROWSER
 _GUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 
@@ -308,8 +283,13 @@ def keka(name: str, slug: str) -> list[dict]:
         # Keka states the bar in its own field; put it where the experience
         # gate reads, ahead of the description.
         desc = f"Experience: {j.get('experience') or 'not stated'}\n{j.get('description') or ''}"
-        out.append(_norm(name, j.get("title"), f"{base}jobdetails/{j.get('id')}", locs,
-                         _epoch(j.get("publishedOn")), desc, "keka"))
+        job = _norm(name, j.get("title"), f"{base}jobdetails/{j.get('id')}", locs,
+                    _epoch(j.get("publishedOn")), desc, "keka")
+        low, high = years_from_field(j.get("experience"))
+        pay = j.get("salaryRange") or {}
+        out.append(_facts(job, years_min=low, years_max=high,
+                          salary=money(pay.get("minimum"), pay.get("maximum"), pay.get("currency") or ""),
+                          board_skills=board_skills(j.get("skillNames") or [])))
     return out
 
 
@@ -328,8 +308,10 @@ def darwinbox(name: str, slug: str) -> list[dict]:
                 locs = "; ".join(x.strip() for x in j.get("tool_tip_locations") or [])
             lo, hi = j.get("experience_from_num"), j.get("experience_to_num")
             exp = f"Experience: {lo}-{hi} years" if lo not in (None, "") else ""
-            out.append(_norm(name, j.get("title"), f"https://{slug}/ms/candidate/careers/{j.get('id')}",
-                             locs, _epoch(j.get("job_posting_on")), exp, "darwinbox"))
+            job = _norm(name, j.get("title"), f"https://{slug}/ms/candidate/careers/{j.get('id')}",
+                        locs, _epoch(j.get("job_posting_on")), exp, "darwinbox")
+            low, high = years_from_field(f"{lo}-{hi} years" if hi not in (None, "") else lo)
+            out.append(_facts(job, years_min=low, years_max=high))
         total = msg.get("jobscount", 0) if isinstance(msg, dict) else 0
         if not jobs or len(out) >= int(total or 0):
             break
@@ -360,7 +342,8 @@ def zoho(name: str, slug: str) -> list[dict]:
             loc = f"{loc} (Remote)" if loc else "Remote"
         desc = f"Experience: {j.get('Work_Experience') or 'not stated'}\n{j.get('Job_Description') or ''}"
         url = f"https://{slug}/jobs/Careers/{j.get('id')}/{re.sub(r'[^A-Za-z0-9]+', '-', title).strip('-')}"
-        out.append(_norm(name, title, url, loc, _epoch(j.get("Date_Opened")), desc, "zoho"))
+        out.append(_with(_norm(name, title, url, loc, _epoch(j.get("Date_Opened")), desc, "zoho"),
+                         _zoho_record(j)))
     return out
 
 
@@ -368,131 +351,18 @@ BOARDS.update({"keka": keka, "darwinbox": darwinbox, "zoho": zoho})
 
 
 # --------------------------------------------------------------------------
-# Job details. Workday and Oracle list endpoints carry no description, so the
-# experience a posting asks for is invisible until its detail page is read.
-# Called once per NEW job that already passed the title/location filters.
-
-def _workday_details(url: str) -> str:
-    u = urlparse(url)
-    tenant = u.netloc.split(".")[0]
-    data = _get(f"https://{u.netloc}/wday/cxs/{tenant}{u.path}")
-    info = data.get("jobPostingInfo") or {}
-    when = info.get("startDate") or ""
-    return (f"Date posted: {when}\n" if when else "") + (info.get("jobDescription") or "")
-
-
-def _oracle_details(url: str) -> str:
-    m = re.match(r"https://([^/]+)/hcmUI/CandidateExperience/[^/]+/sites/([^/]+)/job/([^/?#]+)",
-                 url or "")
-    if not m:
-        return ""
-    host, site, rid = m.groups()
-    data = _get(f"https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails"
-                f'?expand=all&onlyData=true&finder=ById;Id="{rid}",siteNumber={site}')
-    item = (data.get("items") or [{}])[0]
-    return "\n".join(item.get(k) or "" for k in (
-        "ExternalQualificationsStr", "ExternalResponsibilitiesStr", "ExternalDescriptionStr"))
-
-
-def _greenhouse_details(job: dict) -> str:
-    # Only a freshly fetched job carries its API url; a stored one already has
-    # its description saved.
-    return _get(job["api"]).get("content") or "" if job.get("api") else ""
-
-
-def _darwinbox_details(url: str) -> str:
-    m = re.match(r"https://([^/]+)/ms/candidate/careers/([^/?#]+)", url or "")
-    if not m:
-        return ""
-    host, jid = m.groups()
-    data = _request("GET", f"https://{host}/ms/candidateapi/job/{jid}",
-                    headers={**BROWSER, "Accept": "application/json"}).json()
-    job = ((data.get("message") or {}).get("job") or [{}])[0]
-    lo, hi = job.get("experience_from_num"), job.get("experience_to_num")
-    # Keep the structured experience line first: this replaces the list's text.
-    # The detail endpoint counts MONTHS (60-120) where the list says years (5-10).
-    try:
-        exp = f"Experience: {int(lo) // 12}-{int(hi or lo) // 12} years\n"
-    except (TypeError, ValueError):
-        exp = ""
-    return exp + html_mod.unescape(job.get("jd") or "")
-
-
-_JS_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.S)
-_JS_CHARS = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}
-
-
-def _js_unescape(s: str) -> str:
-    """A single-quoted JS string literal's body as the text it stands for."""
-    def one(m: re.Match) -> str:
-        e = m.group(1)
-        return chr(int(e[1:], 16)) if len(e) > 1 else _JS_CHARS.get(e, e)
-    return _JS_ESCAPE.sub(one, s)
-
-
-def _zoho_details(url: str) -> str:
-    # Some boards' careers-page list carries only the title and city; the
-    # detail page embeds the full record as `var jobs = JSON.parse('...')`.
-    page = _request("GET", url, headers=BROWSER).text
-    m = re.search(r"var jobs = JSON\.parse\('((?:[^'\\]|\\.)*)'\)", page, re.S)
-    if not m:
-        return ""
-    import json as _json
-    job = (_json.loads(_js_unescape(m.group(1))) or [{}])[0]
-    opened = str(job.get("Date_Opened") or "")[:10]
-    return ((f"Date opened: {opened}\n" if re.match(r"\d{4}-\d\d-\d\d", opened) else "")
-            + f"Experience: {job.get('Work_Experience') or 'not stated'}\n"
-            f"{job.get('Job_Description') or ''}")
-
-
-DETAILS = {"workday": _workday_details, "oracle": _oracle_details,
-           "greenhouse": _greenhouse_details, "darwinbox": _darwinbox_details,
-           "zoho": _zoho_details}
-
-
-def _greenhouse_by_jid(job: dict) -> str:
-    """A company page showing a Greenhouse job (".../careers/job?gh_jid=123")
-    draws the description with a script, so reading the page finds an empty
-    shell. Greenhouse has it: try the board names the company is likely
-    filed under - the site's name, then the company's."""
-    url = job.get("url") or ""
-    jid = (parse_qs(urlparse(url).query).get("gh_jid") or [""])[0]
-    if not jid.isdigit():
-        return ""
-    host = urlparse(url).netloc.lower().split(":")[0]
-    parts = [p for p in host.split(".") if p not in ("www", "careers", "jobs", "boards", "job-boards")]
-    name = re.sub(r"[^a-z0-9]", "", (job.get("company") or "").lower())
-    tokens = [t for t in dict.fromkeys([parts[0] if parts else "", name,
-                                        re.sub(r"(inc|labs|technologies|tech|india)$", "", name)]) if t]
-    for tok in tokens:
-        try:
-            content = _get(f"https://boards-api.greenhouse.io/v1/boards/{tok}/jobs/{jid}").get("content")
-        except Exception:  # noqa: BLE001 - wrong board name: try the next
-            continue
-        if content:
-            return content
-    return ""
-
+# One posting's full text and facts live in details/: a reader per site with
+# its own posting data, the posting's page, and a headless browser for pages
+# drawn by script.
 
 def fetch_details(job: dict) -> str:
-    """Full description of one posting, for the experience gate. Never raises:
-    a failed lookup leaves the job as it was ("experience not stated").
-
-    Every board gets a reader: its own when it has one, else the posting's
-    page (its JobPosting data, else the page text)."""
-    try:
-        text = _greenhouse_by_jid(job)
-        if text:
-            return text
-        fn = DETAILS.get(job.get("source", ""))
-        if fn is None:
-            from .boards_more import _page_details
-            return _page_details(job["url"]) if job.get("url") else ""
-        return fn(job) if fn is _greenhouse_details else fn(job["url"])
-    except Exception:  # noqa: BLE001
-        return ""
+    """Full description of one posting. Never raises: a failed lookup leaves
+    the job as it was. For callers that only want the text; the scan uses
+    details.read, which keeps every field."""
+    from . import details
+    return details.read(job).text
 
 
 # More platforms and the generic careers-page reader register themselves into
-# BOARDS (and DETAILS) on import; kept in their own module for size.
+# BOARDS on import; kept in their own module for size.
 from . import boards_more  # noqa: E402,F401

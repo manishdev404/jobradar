@@ -29,7 +29,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     experience  TEXT,
     role        TEXT,
     role_rank   INTEGER,
-    role_bonus  REAL NOT NULL DEFAULT 0
+    role_bonus  REAL NOT NULL DEFAULT 0,
+    -- what the posting states as data (details/): read once, when first seen
+    work_mode       TEXT,
+    employment_type TEXT,
+    salary          TEXT,
+    closes_at       REAL,
+    first_posted    REAL,
+    years_min       INTEGER,
+    years_max       INTEGER,
+    skills          TEXT,
+    skills_nice     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_first_seen ON jobs(first_seen);
 CREATE TABLE IF NOT EXISTS runs (
@@ -58,6 +68,13 @@ CREATE TABLE IF NOT EXISTS boards (
     company     TEXT PRIMARY KEY,
     fetched_at  REAL NOT NULL,
     job_count   INTEGER NOT NULL DEFAULT 0
+);
+-- How long each board took to read last time, failed reads included: a scan
+-- puts the slow ones in their own queue so they never hold up the fast ones.
+CREATE TABLE IF NOT EXISTS board_speed (
+    company     TEXT PRIMARY KEY,
+    secs        REAL NOT NULL,
+    read_at     REAL NOT NULL
 );
 -- Your application history. job_id links to a tracked posting when there is
 -- one; applications to jobs Job Radar never saw keep company/title/url only.
@@ -127,6 +144,23 @@ QUEUE = ("applying", "needs_you", "queued")
 _NOT_APPLIED = ("id NOT IN (SELECT job_id FROM applications "
                 "WHERE job_id IS NOT NULL AND status != 'not_applied')")
 
+FACT_COLUMNS = ("work_mode", "employment_type", "salary", "closes_at", "first_posted",
+                "years_min", "years_max", "skills", "skills_nice")
+
+
+def _joined(v) -> str:
+    """A skill list is stored as "Node.js, React" - short, and readable as is."""
+    if isinstance(v, (list, tuple)):
+        return ", ".join(str(x) for x in v if x)
+    return v or ""
+
+
+def _facts(j: dict) -> tuple:
+    """A job's posting facts, in FACT_COLUMNS order."""
+    return (j.get("work_mode") or "", j.get("employment_type") or "", (j.get("salary") or "")[:80],
+            j.get("closes_at"), j.get("first_posted"), j.get("years_min"), j.get("years_max"),
+            _joined(j.get("skills")), _joined(j.get("skills_nice")))
+
 
 class Store:
     def __init__(self, path: str | Path = "jobradar.db"):
@@ -146,7 +180,10 @@ class Store:
                          ("alerted", "INTEGER NOT NULL DEFAULT 0"),
                          ("description", "TEXT"), ("experience", "TEXT"),
                          ("role", "TEXT"), ("role_rank", "INTEGER"),
-                         ("role_bonus", "REAL NOT NULL DEFAULT 0")):
+                         ("role_bonus", "REAL NOT NULL DEFAULT 0"),
+                         ("work_mode", "TEXT"), ("employment_type", "TEXT"), ("salary", "TEXT"),
+                         ("closes_at", "REAL"), ("first_posted", "REAL"), ("years_min", "INTEGER"),
+                         ("years_max", "INTEGER"), ("skills", "TEXT"), ("skills_nice", "TEXT")):
             if col not in have:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
         have = {r["name"] for r in self.db.execute("PRAGMA table_info(applications)")}
@@ -177,15 +214,18 @@ class Store:
                 self.db.execute(
                     """INSERT INTO jobs (id, company, title, url, location, source,
                                          posted_at, first_seen, last_seen, domain, description,
-                                         experience, role, role_rank, role_bonus)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                         experience, role, role_rank, role_bonus,
+                                         work_mode, employment_type, salary, closes_at, first_posted,
+                                         years_min, years_max, skills, skills_nice)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (j["id"], j["company"], j["title"], j["url"], j["location"],
                      j["source"], j["posted_at"], now, now, j.get("domain", ""),
                      # Kept whole: `recheck` re-reads requirements from it, and a
                      # requirement past a cut is invisible. The scoring prompt
                      # takes only a short excerpt, so this costs no tokens.
                      (j.get("description") or "")[:20000], j.get("experience") or "",
-                     j.get("role"), j.get("role_rank"), j.get("role_bonus") or 0),
+                     j.get("role"), j.get("role_rank"), j.get("role_bonus") or 0,
+                     *_facts(j)),
                 )
                 fresh.append(j)
         self.db.commit()
@@ -338,6 +378,18 @@ class Store:
         return {r["company"]: r["fetched_at"] for r in
                 self.db.execute("SELECT company, fetched_at FROM boards")}
 
+    def board_speeds(self) -> dict[str, float]:
+        """company -> seconds its board took to read last time."""
+        return {r["company"]: r["secs"] for r in self.db.execute("SELECT company, secs FROM board_speed")}
+
+    def save_board_speeds(self, secs: dict[str, float]) -> None:
+        now = time.time()
+        self.db.executemany(
+            "INSERT INTO board_speed (company, secs, read_at) VALUES (?,?,?) "
+            "ON CONFLICT(company) DO UPDATE SET secs = excluded.secs, read_at = excluded.read_at",
+            [(c, round(s, 2), now) for c, s in secs.items()])
+        self.db.commit()
+
     def active_companies(self) -> set[str]:
         """Companies worth reading on every scan: India tech jobs at their last
         check, or a job of theirs still open in the list."""
@@ -444,20 +496,35 @@ class Store:
                         (text[:20000], experience, job_id))
         self.db.commit()
 
+    def save_facts(self, job: dict, commit: bool = True) -> None:
+        """A re-read posting's text, date and facts (recheck)."""
+        sets = ", ".join(f"{c} = ?" for c in FACT_COLUMNS)
+        self.db.execute(f"UPDATE jobs SET description = ?, posted_at = ?, {sets} WHERE id = ?",
+                        ((job.get("description") or "")[:20000], job.get("posted_at"), *_facts(job),
+                         job["id"]))
+        if commit:
+            self.db.commit()
+
     def expire_old(self, days: float) -> int:
         """Postings the board says went up more than `days` ago are marked
         expired - a queued one leaves the queue. Jobs you already acted on
         (applied, in process, referral...) keep their status. Returns how many."""
+        acted = """AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id = j.id
+                               AND a.status NOT IN ('not_applied', 'queued', 'failed'))"""
+        # A posting whose own closing date has passed is expired whatever its age.
+        closed = self.db.execute(
+            f"""SELECT j.id FROM jobs j WHERE j.closes_at > 0 AND j.closes_at < ? AND j.closed_at IS NULL
+                {acted}""", (time.time(),)).fetchall()
+        for r in closed:
+            self.set_job_status(r["id"], "expired", "applications closed")
         if not days or days <= 0:
-            return 0
+            return len(closed)
         rows = self.db.execute(
-            """SELECT j.id FROM jobs j WHERE j.posted_at > 0 AND j.posted_at < ?
-               AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id = j.id
-                               AND a.status NOT IN ('not_applied', 'queued', 'failed'))""",
+            f"""SELECT j.id FROM jobs j WHERE j.posted_at > 0 AND j.posted_at < ? {acted}""",
             (time.time() - days * 86400,)).fetchall()
         for r in rows:
             self.set_job_status(r["id"], "expired", f"posted more than {days:g} days ago")
-        return len(rows)
+        return len(closed) + len(rows)
 
     # -- apply queue (the AI apply engine) ------------------------------------
     def enqueue(self, job_id: str) -> int:

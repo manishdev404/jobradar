@@ -27,28 +27,23 @@ import re
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
+from . import net
+from .details.page import jobpostings
 from .sources import BOARDS, BROWSER, _epoch, _norm, _request
 
-_JSON = {**BROWSER, "Accept": "application/json"}
+_JSON = net.JSON
 _INDIA = re.compile(r"\b(india|bengaluru|bangalore|hyderabad|pune|gurgaon|gurugram|noida|delhi|"
                     r"chennai|mumbai|kolkata|ahmedabad|jaipur|kochi|trivandrum|thiruvananthapuram|"
                     r"coimbatore|chandigarh|mohali|indore|mysore|mysuru|visakhapatnam)\b", re.I)
 
 
 def _json(url: str, **kw):
-    return _request("GET", url, headers=_JSON, **kw).json()
+    return net.json(url, headers=_JSON, **kw)
 
 
 def _page(url: str, limit: int = 1_500_000) -> tuple[str, str]:
     """(final url, html) - capped, since some careers pages are huge."""
-    r = _request("GET", url, headers=BROWSER, stream=True)
-    body = b""
-    for chunk in r.iter_content(65536):
-        body += chunk
-        if len(body) >= limit:
-            break
-    r.close()
-    return r.url, body.decode(r.encoding or "utf-8", "replace")
+    return net.page(url, limit=limit, headers=BROWSER)
 
 
 def _text(s: str) -> str:
@@ -260,7 +255,8 @@ def successfactors(name: str, slug: str) -> list[dict]:
             loc = re.search(r'class="jobLocation"[^>]*>(.*?)</span>', row, re.S)
             when = re.search(r'class="jobDate"[^>]*>(.*?)</span>', row, re.S)
             out.append(_norm(name, _text(a.group(2)), urljoin(base, a.group(1)),
-                             _text(loc.group(1)) if loc else "", None, "", "successfactors"))
+                             _text(loc.group(1)) if loc else "",
+                             _epoch(_text(when.group(1))) if when else None, "", "successfactors"))
         if len(rows) < 25:
             break
     return out
@@ -356,22 +352,9 @@ class _Links(HTMLParser):
 
 
 def _jsonld_jobs(page: str) -> list[dict]:
-    found = []
-    for block in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', page, re.S | re.I):
-        try:
-            data = json.loads(block.strip())
-        except ValueError:
-            continue
-        stack = data if isinstance(data, list) else [data]
-        while stack:
-            d = stack.pop()
-            if isinstance(d, dict):
-                if d.get("@type") == "JobPosting":
-                    found.append(d)
-                stack.extend(v for v in d.values() if isinstance(v, (list, dict)))
-            elif isinstance(d, list):
-                stack.extend(d)
-    return found
+    """Every JobPosting in the page's JSON-LD (tolerant of the trailing commas
+    and raw newlines careers sites leave in it)."""
+    return jobpostings(page)
 
 
 def page(name: str, slug: str) -> list[dict]:
@@ -436,48 +419,3 @@ BOARDS.update({
     "jazzhr": jazzhr, "freshteam": freshteam, "icims": icims, "workdaysite": workdaysite,
     "successfactors": successfactors, "phenom": phenom, "page": page,
 })
-
-
-_META_DESC = re.compile(r"<meta[^>]+(?:name|property)=[\"'](?:description|og:description|"
-                        r"twitter:description)[\"'][^>]*content=[\"']([^\"']{80,})[\"']", re.I)
-_JSON_STR = re.compile(r'"((?:[^"\\]|\\.){300,})"')
-_JOB_TEXT = re.compile(r"experience|responsibilit|requirement|qualification", re.I)
-
-
-def _page_details(url: str) -> str:
-    """Description of one posting: its JobPosting data, else the page's text.
-    A page drawn by script shows an empty body; then the longest description
-    it carries - in its meta tags or its embedded data - is used. A posting
-    date found on the way is put first ("Date posted: ...")."""
-    _, html = _page(url, limit=800_000)
-    for d in _jsonld_jobs(html):
-        if d.get("description"):
-            when = d.get("datePosted")
-            return (f"Date posted: {when}\n" if when else "") + _text(d["description"])
-    body = re.search(r"<body[^>]*>(.*)</body>", html, re.S | re.I)
-    text = _text(re.sub(r"<(script|style|nav|header|footer)[^>]*>.*?</\1>", " ",
-                        body.group(1) if body else html, flags=re.S | re.I))
-    if len(text) < 300:
-        # This page's own summary first; else the FIRST description in its data -
-        # later ones are usually "similar jobs", not this one.
-        found = [_text(m.group(1)) for m in _META_DESC.finditer(html)]
-        if not found:
-            for m in _JSON_STR.finditer(html):
-                try:
-                    s = json.loads(f'"{m.group(1)}"')
-                except ValueError:
-                    continue
-                if _JOB_TEXT.search(s):
-                    found.append(_text(s))
-                    break
-        text = max(found + [text], key=len)
-    seen = re.search(r"posted\s*[:\-]?\s*(?:on\s*)?(?:today|yesterday|\d+\+?\s*\w+\s*ago|\d{4}-\d\d-\d\d)",
-                     _text(html), re.I)
-    return ((seen.group(0) + "\n") if seen and seen.group(0) not in text else "") + text[:6000]
-
-
-from .sources import DETAILS  # noqa: E402
-
-DETAILS.update({src: _page_details for src in (
-    "smartrecruiters", "bamboohr", "breezy", "teamtailor", "jobvite", "jazzhr", "freshteam",
-    "icims", "successfactors", "phenom", "page")})
