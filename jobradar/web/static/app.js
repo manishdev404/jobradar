@@ -1,8 +1,13 @@
+// The jobs page. State lives in the Zustand store (store.js); this file draws
+// it and turns clicks, filters and scan events into store actions. Every
+// change schedules one redraw per animation frame, and each part of the page
+// redraws only when the state it shows has changed.
+import {
+  checksJob, isFiltered, isLocked, jobById, mySkills, postedAt, store, topJobs, visibleJobs,
+} from "./store.js";
+
 const $ = (id) => document.getElementById(id);
-const tiles = new Map();          // job id -> tile element
-let jobs = [];
-let scoringOn = true;
-let t0 = 0, timer = null;
+const act = () => store.getState();          // the store's actions
 
 // key -> the plain-language claim the bar is measuring.
 const CHECKS = [
@@ -14,6 +19,33 @@ const CHECKS = [
   ["reach",     "realistic to land"],
 ];
 
+// --- application status ------------------------------------------------------
+const STATUS_LABEL = {
+  not_applied: "Not applied", queued: "In apply queue", applying: "AI applying",
+  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process",
+  referral_asked: "Asked for referral", referral_got: "Got referral",
+  applied: "Applied", ai_applied: "AI apply done", contacted: "Contacted", assessment: "Assessment",
+  interview: "Interview", offer: "Offer", rejected: "Rejected",
+  expired: "Expired", withdrawn: "Withdrawn", over_exp: "Over exp",
+};
+
+const WORK_LABEL = { remote: "Remote", hybrid: "Hybrid", onsite: "On-site" };
+const TYPE_LABEL = { "full-time": "Full-time", "part-time": "Part-time", contract: "Contract",
+  temporary: "Temporary", internship: "Internship" };
+
+// Dot colours on the tiles, grouped the way styles.css colours them.
+const STATUS_DOTS = [
+  ["var(--st-app)", ["queued", "applying", "contacted"]],
+  ["var(--st-proc)", ["in_process", "needs_you"]],
+  ["var(--st-ref-ask)", ["referral_asked"]],
+  ["var(--st-ref-got)", ["referral_got"]],
+  ["var(--st-good)", ["applied", "ai_applied", "assessment", "interview", "offer"]],
+  ["#e5484d", ["failed"]],
+  ["var(--st-bad)", ["rejected", "expired", "withdrawn", "over_exp"]],
+];
+
+// --- small helpers -------------------------------------------------------------
+
 function bucket(score) {
   if (score === null || score === undefined) return "";
   return "s" + Math.min(5, Math.max(1, Math.ceil(score / 2)));
@@ -21,6 +53,13 @@ function bucket(score) {
 
 function logo(domain) {
   return domain ? `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=64` : "";
+}
+
+function addInitial(el, company) {
+  const s = document.createElement("span");
+  s.className = "init";
+  s.textContent = (company || "?").slice(0, 2).toUpperCase();
+  el.appendChild(s);
 }
 
 function attachLogo(el, job, px) {
@@ -37,232 +76,20 @@ function attachLogo(el, job, px) {
   el.appendChild(img);
 }
 
-function makeTile(job) {
-  const el = document.createElement("div");
-  el.className = "tile " + bucket(job.score) + (selectedId === job.id ? " sel" : "");
-  el.title = `${job.title} — ${job.company}` + (job.score !== null ? ` · ${job.score}/10` : "") +
-    (job.app_status ? ` · ${STATUS_LABEL[job.app_status] || job.app_status}` : "") +
-    (job.role ? ` · ${job.role}` : "") + (job.experience ? ` · exp: ${job.experience}` : "") +
-    (job.work_mode ? ` · ${WORK_LABEL[job.work_mode] || job.work_mode}` : "");
-  if (job.app_status && job.app_status !== "not_applied") el.dataset.st = job.app_status;
-  attachLogo(el, job);
-  el.onclick = () => selectJob(job);
-  el.ondblclick = () => { if (job.url) window.open(job.url, "_blank", "noopener"); };
-  return el;
+function safeParse(s) { try { return JSON.parse(s) || {}; } catch { return {}; } }
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
-
-// --- application status ------------------------------------------------------
-const STATUS_LABEL = {
-  not_applied: "Not applied", queued: "In apply queue", applying: "AI applying",
-  needs_you: "AI needs you", failed: "AI apply failed", in_process: "In process",
-  referral_asked: "Asked for referral", referral_got: "Got referral",
-  applied: "Applied", ai_applied: "AI apply done", contacted: "Contacted", assessment: "Assessment",
-  interview: "Interview", offer: "Offer", rejected: "Rejected",
-  expired: "Expired", withdrawn: "Withdrawn", over_exp: "Over exp",
-};
-let selectedId = null;
-
-const WORK_LABEL = { remote: "Remote", hybrid: "Hybrid", onsite: "On-site" };
-const TYPE_LABEL = { "full-time": "Full-time", "part-time": "Part-time", contract: "Contract",
-  temporary: "Temporary", internship: "Internship" };
 
 function dayLabel(ts) {
   return new Date(ts * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
-// Saved as "Node.js, React"; a fresh scan event may carry a list.
-function splitSkills(v) {
-  if (Array.isArray(v)) return v;
-  return (v || "").split(", ").filter(Boolean);
+function clock(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
-
-// A posting's skills, marked by whether your resume names them.
-function skillRow(label, names, must) {
-  const row = document.createElement("div");
-  row.className = "sj-skills";
-  const have = names.filter((n) => mySkills.has(n.toLowerCase())).length;
-  const head = document.createElement("div");
-  head.className = "sj-meta";
-  head.textContent = must && mySkills.size ? `${label} · ${have} of ${names.length} on your resume` : label;
-  const chips = document.createElement("div");
-  chips.className = "skills";
-  for (const n of names) {
-    const chip = document.createElement("span");
-    const yours = mySkills.has(n.toLowerCase());
-    chip.className = "sk " + (yours ? "good" : must ? "missing" : "listed");
-    chip.title = yours ? "on your resume" : "not on your resume";
-    chip.textContent = n;
-    chips.appendChild(chip);
-  }
-  row.append(head, chips);
-  return row;
-}
-
-function statusSelect(current, onChange) {
-  const sel = document.createElement("select");
-  sel.className = "stsel";
-  for (const [value, label] of Object.entries(STATUS_LABEL)) {
-    const o = document.createElement("option");
-    o.value = value; o.textContent = label;
-    sel.appendChild(o);
-  }
-  sel.value = current || "not_applied";
-  sel.onchange = () => onChange(sel.value);
-  return sel;
-}
-
-function selectJob(job) {
-  if (selectedId) tiles.get(selectedId)?.classList.remove("sel");
-  selectedId = job.id;
-  tiles.get(job.id)?.classList.add("sel");
-  renderChecks(job);
-
-  const box = $("seljob");
-  box.textContent = "";
-  const title = document.createElement("div");
-  title.className = "sj-title"; title.textContent = job.title;
-  const meta = document.createElement("div");
-  meta.className = "sj-meta";
-  meta.textContent = [job.company, job.location,
-    job.score !== null && job.score !== undefined ? `${job.score}/10` : "not scored yet",
-    postedLabel(job)]
-    .filter(Boolean).join(" · ");
-  const exp = document.createElement("div");
-  exp.className = "sj-meta";
-  exp.textContent = `Role: ${job.role || "—"} · Experience asked: ${job.experience || "not stated"}`;
-  box.append(title, meta, exp);
-  // What the posting states as data (details/): work mode, type, pay, dates.
-  const facts = [WORK_LABEL[job.work_mode], TYPE_LABEL[job.employment_type], job.salary,
-    job.closes_at ? `applications close ${dayLabel(job.closes_at)}` : "",
-    // an evergreen posting: re-dated by edits, first put up long ago
-    job.first_posted && (job.posted_at || 0) - job.first_posted > 30 * 86400
-      ? `first posted ${dayLabel(job.first_posted)}` : ""].filter(Boolean);
-  if (facts.length) {
-    const f = document.createElement("div");
-    f.className = "sj-meta sj-facts";
-    f.textContent = facts.join(" · ");
-    box.appendChild(f);
-  }
-  const must = splitSkills(job.skills), nice = splitSkills(job.skills_nice);
-  if (must.length) box.appendChild(skillRow("Must have", must, true));
-  if (nice.length) box.appendChild(skillRow("Nice to have", nice, false));
-  if (job.reason) {
-    const why = document.createElement("div");
-    why.className = "sj-reason"; why.textContent = job.reason;
-    box.appendChild(why);
-  }
-  const actions = document.createElement("div");
-  actions.className = "sj-actions";
-  const saved = document.createElement("span");
-  saved.className = "sj-saved";
-  const sel = statusSelect(job.app_status, async (status) => {
-    saved.textContent = "saving…";
-    const send = () => fetch(`/api/jobs/${encodeURIComponent(job.id)}/status`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
-    try {
-      let r;
-      try {
-        r = await send();
-      } catch {               // network blip: one retry before giving up
-        await new Promise((ok) => setTimeout(ok, 1500));
-        try { r = await send(); } catch {
-          throw new Error("the Job Radar server is not running - start it with .\\start, then try again");
-        }
-      }
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `server error ${r.status}`);
-      job.app_status = status;
-      saved.textContent = "saved to history";
-      renderGrid();
-    } catch (e) {
-      saved.textContent = `not saved: ${e.message}`;
-      sel.value = job.app_status || "not_applied";
-    }
-  });
-  actions.appendChild(sel);
-  const inQueue = ["queued", "applying", "needs_you"].includes(job.app_status);
-  const applied = job.app_status && !["not_applied", "failed"].includes(job.app_status) && !inQueue;
-  const q = document.createElement("button");
-  q.type = "button"; q.className = "sj-queue";
-  q.textContent = inQueue ? "In apply queue" : "Add to apply queue";
-  q.disabled = inQueue || applied;
-  q.title = applied ? "already applied" : "the AI engine will apply to it - see Job apply queue";
-  q.onclick = async () => {
-    q.disabled = true;
-    const d = await queueJobs([job.id]);
-    if (d.added.length) {
-      job.app_status = "queued"; sel.value = "queued";
-      q.textContent = "In apply queue";
-      saved.textContent = "added - open Job apply queue to start";
-      renderGrid();
-    } else {
-      q.disabled = false;
-      saved.textContent = `not queued: ${(d.refused[0] || {}).why || "refused"}`;
-    }
-  };
-  actions.appendChild(q);
-  if (job.url) {
-    const open = document.createElement("a");
-    open.className = "sj-open"; open.href = job.url; open.target = "_blank"; open.rel = "noopener";
-    open.textContent = "Open posting ↗";
-    actions.appendChild(open);
-  }
-  actions.appendChild(saved);
-  box.appendChild(actions);
-}
-
-async function queueJobs(ids) {
-  let r;
-  try {
-    r = await fetch("/api/apply/queue", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_ids: ids }),
-    });
-  } catch {
-    return { added: [], refused: ids.map(() => ({ why: "the Job Radar server is not running" })) };
-  }
-  return r.ok ? r.json() : { added: [], refused: [{ why: `server error ${r.status}` }] };
-}
-
-function addInitial(el, company) {
-  const s = document.createElement("span");
-  s.className = "init";
-  s.textContent = (company || "?").slice(0, 2).toUpperCase();
-  el.appendChild(s);
-}
-
-// --- filtering -------------------------------------------------------------
-const WEEK = 7 * 24 * 3600;
-
-function currentFilter() {
-  return {
-    q: ($("q").value || "").trim().toLowerCase(),
-    days: Number($("posted").value || 0),
-    min: Number($("minscore").value || 0),
-    company: $("co").value || "",
-    newOnly: $("newonly").checked,
-    status: $("stfilter").value || "",
-    role: $("rolefilter").value || "",
-  };
-}
-
-function statusMatches(job, want) {
-  const st = job.app_status && job.app_status !== "not_applied" ? job.app_status : "";
-  if (!want) return true;
-  if (want === "none") return !st;
-  if (want === "any") return !!st;
-  return st === want;
-}
-
-// Ids matching the current text query, resolved server-side so descriptions
-// are searchable without shipping megabytes of them to the browser.
-// null means "no query running", not "nothing matched".
-let searchIds = null;
-
-// When the job went up, by the job site. No date known: 0, so a time range
-// never lets it in on "first seen" - a 9-month-old repost is not new.
-const postedAt = (job) => job.posted_at || 0;
 
 function postedLabel(job) {
   const t = postedAt(job);
@@ -272,149 +99,147 @@ function postedLabel(job) {
   return `posted ${when}`;
 }
 
-function matches(job, f) {
-  // posting age first: everything else only looks at jobs inside the range
-  if (f.days && Date.now() / 1000 - postedAt(job) > f.days * 86400) return false;
-  if (f.company && job.company !== f.company) return false;
-  if (f.min && (job.score === null || job.score === undefined || job.score < f.min)) return false;
-  if (f.newOnly && (!job.first_seen || Date.now() / 1000 - job.first_seen > WEEK)) return false;
-  if (f.q && searchIds && !searchIds.has(job.id)) return false;
-  if (!statusMatches(job, f.status)) return false;
-  if (f.role && job.role !== f.role) return false;
-  return true;
+// Saved as "Node.js, React"; a fresh scan event may carry a list.
+function splitSkills(v) {
+  if (Array.isArray(v)) return v;
+  return (v || "").split(", ").filter(Boolean);
 }
 
-async function runSearch() {
-  const q = ($("q").value || "").trim();
-  if (!q) { searchIds = null; renderGrid(); return; }
-  try {
-    const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-    const d = await r.json();
-    searchIds = d.ids === null ? null : new Set(d.ids);
-  } catch {
-    searchIds = null;        // a failed lookup shows everything, not nothing
+// --- the grid ----------------------------------------------------------------------
+
+// job id -> its tile. A tile is kept while its job object is unchanged, so a
+// reload or a score update rebuilds only the tiles whose job changed.
+const tiles = new Map();
+
+function makeTile(job) {
+  const el = document.createElement("div");
+  el.className = "tile " + bucket(job.score);
+  el.title = `${job.title} — ${job.company}` + (job.score !== null ? ` · ${job.score}/10` : "") +
+    (job.app_status ? ` · ${STATUS_LABEL[job.app_status] || job.app_status}` : "") +
+    (job.role ? ` · ${job.role}` : "") + (job.experience ? ` · exp: ${job.experience}` : "") +
+    (job.work_mode ? ` · ${WORK_LABEL[job.work_mode] || job.work_mode}` : "");
+  if (job.app_status && job.app_status !== "not_applied") el.dataset.st = job.app_status;
+  attachLogo(el, job);
+  el.onclick = () => act().select(job.id);
+  el.ondblclick = () => { if (job.url) window.open(job.url, "_blank", "noopener"); };
+  el._job = job;
+  return el;
+}
+
+function renderGrid(s) {
+  const list = visibleJobs(s);
+  const keep = new Set();
+  const frag = document.createDocumentFragment();
+  for (const j of list) {
+    let el = tiles.get(j.id);
+    if (!el || el._job !== j) { el = makeTile(j); tiles.set(j.id, el); }
+    keep.add(j.id);
+    frag.appendChild(el);
   }
-  renderGrid();
+  for (const id of [...tiles.keys()]) if (!keep.has(id)) tiles.delete(id);
+  $("grid").replaceChildren(frag);
+  return list;
 }
 
-// Dot colours on the tiles, grouped the way styles.css colours them.
-const STATUS_DOTS = [
-  ["var(--st-app)", ["queued", "applying", "contacted"]],
-  ["var(--st-proc)", ["in_process", "needs_you"]],
-  ["var(--st-ref-ask)", ["referral_asked"]],
-  ["var(--st-ref-got)", ["referral_got"]],
-  ["var(--st-good)", ["applied", "ai_applied", "assessment", "interview", "offer"]],
-  ["#e5484d", ["failed"]],
-  ["var(--st-bad)", ["rejected", "expired", "withdrawn", "over_exp"]],
-];
+function markSelected(s) {
+  for (const [id, el] of tiles) el.classList.toggle("sel", id === s.selectedId);
+}
 
-function renderLegend() {
+// Fetching is the long half of a scan: light up the company being read (or
+// the job being scored) so the grid shows progress instead of sitting still.
+let lit = [];
+function applyHighlight(s, scroll) {
+  for (const el of lit) el.classList.remove("active");
+  lit = [];
+  const h = s.scan.highlight;
+  if (h && h.id) {
+    const el = tiles.get(h.id);
+    if (el) lit.push(el);
+  } else if (h && h.company) {
+    for (const j of s.jobs) {
+      if (j.company !== h.company) continue;
+      const el = tiles.get(j.id);
+      if (el) lit.push(el);
+      if (lit.length >= 40) break;
+    }
+  }
+  for (const el of lit) el.classList.add("active");
+  if (scroll && lit[0]) lit[0].scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function renderGridNote(s, shown) {
+  const sc = s.scan;
+  let text;
+  if (sc.watching && (sc.alert || sc.note)) {
+    text = sc.alert || sc.note;
+  } else if (!s.jobs.length) {
+    text = "no jobs yet — press Scan";
+  } else if (!shown) {
+    text = "nothing matches — clear the filters";
+  } else {
+    text = (isFiltered(s.filters) ? `${shown} of ${s.jobs.length} jobs` : `${s.jobs.length} jobs`) +
+      " · click a tile to select it, double-click to open the posting";
+    if (sc.alert) text = `${sc.alert} · ${text}`;      // the last scan's warning stays in view
+  }
+  $("gridnote").textContent = text;
+}
+
+function renderLegend(s) {
   const counts = {};
-  for (const j of jobs) if (j.app_status) counts[j.app_status] = (counts[j.app_status] || 0) + 1;
+  for (const j of s.jobs) if (j.app_status) counts[j.app_status] = (counts[j.app_status] || 0) + 1;
   $("stlegend").innerHTML = STATUS_DOTS.map(([color, sts]) => {
-    const n = sts.reduce((a, s) => a + (counts[s] || 0), 0);
-    const names = sts.map((s) => STATUS_LABEL[s] || s).join(" / ");
+    const n = sts.reduce((a, st) => a + (counts[st] || 0), 0);
+    const names = sts.map((st) => STATUS_LABEL[st] || st).join(" / ");
     return `<span class="lg${n ? "" : " zero"}"><i style="background:${color}"></i>` +
       `${escapeHtml(names)} <b>${n}</b></span>`;
   }).join("");
 }
 
-// Grid order: jobs still to act on first; then, toward the bottom, in this
-// order: asked for referral, in process (with the stages after it), got
-// referral, applied, AI applied, expired, withdrawn, rejected, over experience. The server's
-// order (best first, mixed across companies) is kept inside each group.
-const GRID_GROUP = {
-  referral_asked: 1,
-  in_process: 2, contacted: 2, assessment: 2, interview: 2, offer: 2,
-  referral_got: 3, applied: 4, ai_applied: 5, expired: 6, withdrawn: 7, rejected: 8,
-  over_exp: 9,                          // asks for more experience: last of all
-};
-function gridGroup(job) {
-  return GRID_GROUP[job.app_status] || 0;      // not applied / AI queue: top
-}
-
-function renderGrid() {
-  renderLegend();
-  const grid = $("grid");
-  const f = currentFilter();
-  grid.textContent = "";
-  tiles.clear();
-  let shown = 0;
-  const ordered = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].flatMap((g) => jobs.filter((j) => gridGroup(j) === g));
-  for (const j of ordered) {
-    if (!matches(j, f)) continue;
-    const el = makeTile(j);
-    tiles.set(j.id, el);
-    grid.appendChild(el);
-    shown++;
-  }
-  const filtered = f.q || f.min || f.company || f.newOnly || f.status || f.role;
-  if (!jobs.length) {
-    $("gridnote").textContent = "no jobs yet — press Scan";
-  } else if (!shown) {
-    $("gridnote").textContent = "nothing matches — clear the filters";
-  } else if (f.q && !searchIds) {
-    $("gridnote").textContent = `${shown} jobs · searching…`;
-  } else {
-    $("gridnote").textContent =
-      (filtered ? `${shown} of ${jobs.length} jobs` : `${jobs.length} jobs`) +
-      " · click a tile to select it, double-click to open the posting";
-  }
-}
-
-function fillCompanies() {
-  const sel = $("co");
-  const chosen = sel.value;
-  const names = [...new Set(jobs.map((j) => j.company))].sort();
+// A filter dropdown filled from the jobs themselves. A choice no job has any
+// more is cleared, in the store too, so the grid never filters by a ghost.
+function fillSelect(id, allLabel, names, filterKey, current) {
+  const sel = $(id);
   sel.textContent = "";
   const all = document.createElement("option");
-  all.value = ""; all.textContent = "all companies";
+  all.value = ""; all.textContent = allLabel;
   sel.appendChild(all);
   for (const n of names) {
     const o = document.createElement("option");
     o.value = n; o.textContent = n;
     sel.appendChild(o);
   }
-  sel.value = chosen;
+  if (current && !names.includes(current)) act().setFilter(filterKey, "");
+  sel.value = names.includes(current) ? current : "";
+}
+
+function fillCompanies(s) {
+  fillSelect("co", "all companies", [...new Set(s.jobs.map((j) => j.company))].sort(), "company",
+             s.filters.company);
 }
 
 // Role names come from the jobs themselves (config.yaml filters.roles plus
 // "Skill match"), so the list never drifts from what is stored. Ordered by
 // role priority, as in the grid.
-function fillRoles() {
-  const sel = $("rolefilter");
-  const chosen = sel.value;
+function fillRoles(s) {
   const rank = {};
-  for (const j of jobs) if (j.role) rank[j.role] = Math.min(rank[j.role] ?? 99, j.role_rank || 9);
-  sel.textContent = "";
-  const all = document.createElement("option");
-  all.value = ""; all.textContent = "all roles";
-  sel.appendChild(all);
-  for (const n of Object.keys(rank).sort((a, b) => rank[a] - rank[b] || a.localeCompare(b))) {
-    const o = document.createElement("option");
-    o.value = n; o.textContent = n;
-    sel.appendChild(o);
-  }
-  sel.value = [...sel.options].some((o) => o.value === chosen) ? chosen : "";
+  for (const j of s.jobs) if (j.role) rank[j.role] = Math.min(rank[j.role] ?? 99, j.role_rank || 9);
+  const names = Object.keys(rank).sort((a, b) => rank[a] - rank[b] || a.localeCompare(b));
+  fillSelect("rolefilter", "all roles", names, "role", s.filters.role);
 }
 
-let debounce = null;
-function onFilterChange() {
-  clearTimeout(debounce);
-  debounce = setTimeout(runSearch, 220);
-}
+// --- side panels ----------------------------------------------------------------
 
-function renderStats(s) {
-  $("s-checked").textContent = s.checked;
-  $("s-total").textContent = s.total;
-  $("s-hire").textContent = s.would_hire;
-  $("s-avg").textContent = Number(s.avg).toFixed(2);
-  // Only /api/state sends the company counts; scoring updates leave them be.
-  if (s.crawled !== undefined) {
-    $("s-crawled").textContent = s.crawled;
-    $("s-indb").textContent = s.in_db;
-    $("s-companies").title = `${s.crawled} companies scanned out of ${s.in_db} in the DB. ` +
-      `${s.listed} have a job board Job Radar can read; the rest are kept with their ` +
+function renderStats(st) {
+  $("s-checked").textContent = st.checked;
+  $("s-total").textContent = st.total;
+  $("s-hire").textContent = st.would_hire;
+  $("s-avg").textContent = Number(st.avg).toFixed(2);
+  // Only /api/state sends the company counts; score updates leave them be.
+  if (st.crawled !== undefined) {
+    $("s-crawled").textContent = st.crawled;
+    $("s-indb").textContent = st.in_db;
+    $("s-companies").title = `${st.crawled} companies scanned out of ${st.in_db} in the DB. ` +
+      `${st.listed} have a job board Job Radar can read; the rest are kept with their ` +
       `careers page only.`;
   }
 }
@@ -441,21 +266,12 @@ function renderCrawls(rows) {
   }).join("");
 }
 
-// Lists sort by score plus the role's bonus (frontend -1), then role priority.
-function rankCmp(a, b) {
-  return (b.score + (b.role_bonus || 0)) - (a.score + (a.role_bonus || 0)) ||
-         (a.role_rank || 9) - (b.role_rank || 9);
-}
-
-function renderTops() {
-  const scored = jobs.filter((j) => j.score !== null && j.score !== undefined);
-  scored.sort(rankCmp);
-  const top = scored.slice(0, 5);
+function renderTops(s) {
+  const top = topJobs(s);
   const box = $("tops");
   box.textContent = "";
   if (!top.length) {
-    box.innerHTML = `<div class="muted">${
-      scoringOn ? "nothing scored yet" : "ranking needs a model"}</div>`;
+    box.innerHTML = `<div class="muted">${s.scoringOn ? "nothing scored yet" : "ranking needs a model"}</div>`;
     return;
   }
   for (const j of top) {
@@ -475,10 +291,10 @@ function renderTops() {
   }
 }
 
-function renderChecks(job) {
+function renderChecks(s, job) {
   const ul = $("checks");
   ul.textContent = "";
-  if (!scoringOn) {
+  if (!s.scoringOn) {
     ul.innerHTML = '<li class="offnote">Scoring is off. Openings, closures and the ' +
       'weekly email still work — set <code>llm.provider</code> in config.yaml to rank them.</li>';
     return;
@@ -500,69 +316,8 @@ function renderChecks(job) {
   }
 }
 
-function safeParse(s) { try { return JSON.parse(s) || {}; } catch { return {}; } }
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-let watching = false;      // true while this tab has the live scan stream open
-let pollTimer = null;
-
-// The time range is locked while a scan runs - in this tab, or one found
-// running after a reload (the server says which range it was started with).
-function lockRange(on, days, started) {
-  const sel = $("posted");
-  if (on && days !== undefined && days !== null) {
-    sel.value = String(days);
-    renderGrid();
-  }
-  sel.disabled = on;
-  const range = sel.options[sel.selectedIndex].text;
-  const since = started ? ` · started ${new Date(started * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "";
-  $("scanstatus").innerHTML = on
-    ? `Scanning jobs posted in <b>${escapeHtml(range)}</b>${since} · the range unlocks when the scan is done`
-    : "";
-}
-
-// Your last range comes back after a reload (only in this browser).
-try {
-  const saved = localStorage.getItem("jr-posted");
-  if (saved !== null && [...$("posted").options].some((o) => o.value === saved)) $("posted").value = saved;
-} catch { /* storage blocked: start at "any time" */ }
-
-async function loadState() {
-  const r = await fetch("/api/state");
-  const d = await r.json();
-  jobs = d.jobs;
-  scoringOn = d.scoring !== false;
-  fillCompanies();
-  fillRoles();
-  renderGrid(); renderStats(d.stats); renderTops(); renderCrawls(d.crawls || []);
-  if (!selectedId) renderChecks(jobs.find((j) => j.score !== null) || null);
-  // A scan started elsewhere (another tab, the scheduler, before a reload):
-  // no live stream here, so refresh every 15s until it finishes. Each refresh
-  // adds that batch's jobs to the grid; nothing already shown is removed.
-  clearTimeout(pollTimer);
-  if (d.scanning && !watching) {
-    $("batchbar").hidden = false;
-    $("bb-label").textContent = "Scan running";
-    $("bb-range").textContent = "· new jobs appear here batch by batch";
-    $("bb-kept").textContent = `${jobs.length} jobs so far`;
-    $("scan").disabled = true; $("scan").textContent = "Scanning…";
-    lockRange(true, d.scan_days, d.scan_started);
-    pollTimer = setTimeout(loadState, 15000);
-  } else if (!watching && $("scan").disabled) {
-    $("scan").disabled = false; $("scan").textContent = "Scan";
-    lockRange(false);
-    $("bb-label").textContent = "Scan complete";
-    $("bb-range").textContent = "";
-  }
-}
-
-async function loadProfile() {
-  const d = await fetch("/api/profile").then((r) => r.json());
+function renderProfile(d) {
+  if (!d) return;
   if (d.name) {
     $("p-name").textContent = d.name;
     $("who").textContent = d.name.split(" ")[0];
@@ -587,18 +342,16 @@ async function loadProfile() {
 
 // Resume skills, most done first (skill.py), then per track what the collected
 // jobs ask for that the resume only lists or lacks.
-let mySkills = new Set();   // lower-cased names, to mark a job's skills you have
-async function loadSkills() {
-  const d = await fetch("/api/skills").then((r) => r.json());
+function renderSkills(d) {
+  if (!d) return;
   const box = $("skills");
   if (!(d.skills || []).length) {
     box.innerHTML = `<span class="muted">${escapeHtml(d.error || "no skills found on the resume")}</span>`;
     return;
   }
-  mySkills = new Set(d.skills.map((s) => s.name.toLowerCase()));
-  box.innerHTML = d.skills.map((s) =>
-    `<span class="sk ${s.tier}" title="${escapeHtml(s.category)} · work ${s.work} · projects ${s.projects}` +
-    `${s.listed ? " · listed" : ""} · ${s.rating ? `your rating ${s.rating}/10` : `score ${s.score}`}">${escapeHtml(s.name)}</span>`).join("");
+  box.innerHTML = d.skills.map((k) =>
+    `<span class="sk ${k.tier}" title="${escapeHtml(k.category)} · work ${k.work} · projects ${k.projects}` +
+    `${k.listed ? " · listed" : ""} · ${k.rating ? `your rating ${k.rating}/10` : `score ${k.score}`}">${escapeHtml(k.name)}</span>`).join("");
   $("workon").innerHTML = (d.tracks || []).map((t) => {
     const items = t.work_on.length
       ? t.work_on.map((a) => `<span class="sk ${a.yours}" title="asked by ${Math.round(a.share * 100)}% of ` +
@@ -610,152 +363,333 @@ async function loadSkills() {
   }).join("");
 }
 
-let lit = [];
-let batchNew = 0;         // new jobs added across the batches of the current scan
-function clearLit() {
-  for (const el of lit) el.classList.remove("active");
-  lit = [];
+// --- the selected job ------------------------------------------------------------
+
+function statusSelect(current, onChange) {
+  const sel = document.createElement("select");
+  sel.className = "stsel";
+  for (const [value, label] of Object.entries(STATUS_LABEL)) {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = label;
+    sel.appendChild(o);
+  }
+  sel.value = current || "not_applied";
+  sel.onchange = () => onChange(sel.value);
+  return sel;
 }
 
-function highlightCompany(company) {
-  clearLit();
-  let first = null;
-  for (const j of jobs) {
-    if (j.company !== company) continue;
-    const el = tiles.get(j.id);
-    if (!el) continue;
-    el.classList.add("active");
-    lit.push(el);
-    if (!first) first = el;
-    if (lit.length >= 40) break;
+// A posting's skills, marked by whether your resume names them.
+function skillRow(label, names, must, yours) {
+  const row = document.createElement("div");
+  row.className = "sj-skills";
+  const have = names.filter((n) => yours.has(n.toLowerCase())).length;
+  const head = document.createElement("div");
+  head.className = "sj-meta";
+  head.textContent = must && yours.size ? `${label} · ${have} of ${names.length} on your resume` : label;
+  const chips = document.createElement("div");
+  chips.className = "skills";
+  for (const n of names) {
+    const chip = document.createElement("span");
+    const mine = yours.has(n.toLowerCase());
+    chip.className = "sk " + (mine ? "good" : must ? "missing" : "listed");
+    chip.title = mine ? "on your resume" : "not on your resume";
+    chip.textContent = n;
+    chips.appendChild(chip);
   }
-  if (first) first.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  row.append(head, chips);
+  return row;
+}
+
+function renderSelected(s, job) {
+  const box = $("seljob");
+  box.textContent = "";
+  if (!job) {
+    box.innerHTML = '<div class="muted">click a tile to see the job and set its status</div>';
+    return;
+  }
+  const title = document.createElement("div");
+  title.className = "sj-title"; title.textContent = job.title;
+  const meta = document.createElement("div");
+  meta.className = "sj-meta";
+  meta.textContent = [job.company, job.location,
+    job.score !== null && job.score !== undefined ? `${job.score}/10` : "not scored yet",
+    postedLabel(job)]
+    .filter(Boolean).join(" · ");
+  const exp = document.createElement("div");
+  exp.className = "sj-meta";
+  exp.textContent = `Role: ${job.role || "—"} · Experience asked: ${job.experience || "not stated"}`;
+  box.append(title, meta, exp);
+  // What the posting states as data (details/): work mode, type, pay, dates.
+  const facts = [WORK_LABEL[job.work_mode], TYPE_LABEL[job.employment_type], job.salary,
+    job.closes_at ? `applications close ${dayLabel(job.closes_at)}` : "",
+    // an evergreen posting: re-dated by edits, first put up long ago
+    job.first_posted && (job.posted_at || 0) - job.first_posted > 30 * 86400
+      ? `first posted ${dayLabel(job.first_posted)}` : ""].filter(Boolean);
+  if (facts.length) {
+    const f = document.createElement("div");
+    f.className = "sj-meta sj-facts";
+    f.textContent = facts.join(" · ");
+    box.appendChild(f);
+  }
+  const yours = mySkills(s);
+  const must = splitSkills(job.skills), nice = splitSkills(job.skills_nice);
+  if (must.length) box.appendChild(skillRow("Must have", must, true, yours));
+  if (nice.length) box.appendChild(skillRow("Nice to have", nice, false, yours));
+  if (job.reason) {
+    const why = document.createElement("div");
+    why.className = "sj-reason"; why.textContent = job.reason;
+    box.appendChild(why);
+  }
+  const note = s.statusNote && s.statusNote.id === job.id ? s.statusNote : null;
+  const busy = !!(note && note.busy);
+  const actions = document.createElement("div");
+  actions.className = "sj-actions";
+  const sel = statusSelect(job.app_status, (status) => saveStatus(job, status));
+  sel.disabled = busy;
+  actions.appendChild(sel);
+  const inQueue = ["queued", "applying", "needs_you"].includes(job.app_status);
+  const applied = job.app_status && !["not_applied", "failed"].includes(job.app_status) && !inQueue;
+  const q = document.createElement("button");
+  q.type = "button"; q.className = "sj-queue";
+  q.textContent = inQueue ? "In apply queue" : "Add to apply queue";
+  q.disabled = inQueue || applied || busy;
+  q.title = applied ? "already applied" : "the AI engine will apply to it - see Job apply queue";
+  q.onclick = () => queueJob(job);
+  actions.appendChild(q);
+  if (job.url) {
+    const open = document.createElement("a");
+    open.className = "sj-open"; open.href = job.url; open.target = "_blank"; open.rel = "noopener";
+    open.textContent = "Open posting ↗";
+    actions.appendChild(open);
+  }
+  const saved = document.createElement("span");
+  saved.className = "sj-saved";
+  saved.textContent = note ? note.text : "";
+  actions.appendChild(saved);
+  box.appendChild(actions);
+}
+
+async function saveStatus(job, status) {
+  const { noteStatus, patchJob } = act();
+  noteStatus(job.id, "saving…", true);
+  const send = () => fetch(`/api/jobs/${encodeURIComponent(job.id)}/status`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  try {
+    let r;
+    try {
+      r = await send();
+    } catch {               // network blip: one retry before giving up
+      await new Promise((ok) => setTimeout(ok, 1500));
+      try { r = await send(); } catch {
+        throw new Error("the Job Radar server is not running - start it with .\\start, then try again");
+      }
+    }
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `server error ${r.status}`);
+    const done = await r.json().catch(() => ({}));
+    patchJob(job.id, { app_status: status });
+    noteStatus(job.id, done.sheet ? `saved to history · ${done.sheet}` : "saved to history");
+  } catch (e) {
+    noteStatus(job.id, `not saved: ${e.message}`);     // the dropdown redraws at the saved status
+  }
+}
+
+async function queueJobs(ids) {
+  let r;
+  try {
+    r = await fetch("/api/apply/queue", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_ids: ids }),
+    });
+  } catch {
+    return { added: [], refused: ids.map(() => ({ why: "the Job Radar server is not running" })) };
+  }
+  return r.ok ? r.json() : { added: [], refused: [{ why: `server error ${r.status}` }] };
+}
+
+async function queueJob(job) {
+  const { noteStatus, patchJob } = act();
+  noteStatus(job.id, "adding…", true);
+  const d = await queueJobs([job.id]);
+  if (d.added.length) {
+    patchJob(job.id, { app_status: "queued" });
+    noteStatus(job.id, "added - open Job apply queue to start");
+  } else {
+    noteStatus(job.id, `not queued: ${(d.refused[0] || {}).why || "refused"}`);
+  }
+}
+
+// --- the scan: progress, the range lock, the timer ------------------------------------
+
+function renderScan(s) {
+  const sc = s.scan;
+  const locked = isLocked(s);
+  const elsewhere = s.server.scanning && !sc.watching;      // another tab, the scheduler, a reload
+
+  const lk = sc.looking;
+  $("lk-company").textContent = lk ? lk.company : "idle";
+  $("lk-title").textContent = lk ? lk.title : "";
+  $("lk-score").textContent = lk ? lk.score : "";
+
+  const btn = $("scan");
+  btn.disabled = locked;
+  btn.textContent = sc.watching && sc.batch ? `Scanning ${sc.batch.index}/${sc.batch.count}…`
+    : locked ? "Scanning…" : "Scan";
+
+  // The time range is locked while a scan runs - in this tab, or one found
+  // running after a reload (the server says which range it was started with).
+  const sel = $("posted");
+  if (sel.value !== String(s.filters.days)) sel.value = String(s.filters.days);
+  sel.disabled = locked;
+  const range = sel.options[sel.selectedIndex]?.text || "";
+  const started = sc.watching ? sc.startedAt / 1000 : s.server.started;
+  $("scanstatus").innerHTML = locked
+    ? `Scanning jobs posted in <b>${escapeHtml(range)}</b>${started ? ` · started ${clock(started)}` : ""}` +
+      " · the range unlocks when the scan is done"
+    : "";
+
+  // One click walks every company, a batch at a time. Jobs from earlier
+  // batches (and earlier scans) stay on the grid; each batch adds to them.
+  $("batchbar").hidden = !(sc.watching || elsewhere || sc.done || sc.batch);
+  $("bb-label").textContent = sc.watching && sc.batch ? `Batch ${sc.batch.index} of ${sc.batch.count}`
+    : elsewhere ? "Scan running" : sc.watching ? "Starting scan" : sc.done ? "Scan complete" : "";
+  const where = $("bb-range");
+  where.textContent = sc.details ? `· ${sc.details.line}`
+    : sc.watching && sc.batch ? `· companies ${sc.batch.first}–${sc.batch.last}` +
+      (sc.batch.total ? ` of ${sc.batch.total}` : "")
+    : elsewhere ? "· new jobs appear here batch by batch" : "";
+  // what reading the postings themselves found, per board
+  where.title = sc.details ? sc.details.errors.map(([why, n]) => `${why} ×${n}`).join("\n") : "";
+  $("bb-fill").style.width = `${sc.fill}%`;
+  let kept = "";
+  if (elsewhere) {
+    kept = `${s.jobs.length} jobs so far`;
+  } else if (sc.watching || sc.done) {
+    kept = `${sc.newJobs} new jobs added this scan` +
+      (sc.due !== null ? ` · ${sc.checked} of ${sc.due} companies checked` : "");
+    // slow careers sites read in their own queue, so the fast ones never wait
+    if (sc.lanes && sc.lanes.slow) {
+      kept += ` · slow queue: ${sc.lanes.slow} sites` +
+        (sc.lanes.moved ? ` (${sc.lanes.moved} timed out in the fast queue)` : "");
+    }
+  }
+  $("bb-kept").textContent = kept;
+}
+
+let timer = null;
+function renderTimer(s) {
+  clearInterval(timer);
+  if (s.scan.watching) {
+    const t0 = s.scan.startedAt;
+    timer = setInterval(() => { $("s-time").textContent = ((Date.now() - t0) / 1000).toFixed(1); }, 100);
+  } else if (s.scan.elapsed !== null) {
+    $("s-time").textContent = s.scan.elapsed.toFixed(1);
+  }
+}
+
+// --- drawing: the state onto the page ------------------------------------------------
+
+let drawn = { scan: {}, server: {}, filters: {} };   // the state last drawn
+let shownJobs = [];
+let lastChecks, lastSelected;
+let queued = false;
+
+function draw() {
+  queued = false;
+  const s = store.getState();
+  const p = drawn;
+  drawn = s;
+  const gridChanged = s.jobs !== p.jobs || s.filters !== p.filters || s.searchIds !== p.searchIds;
+  if (gridChanged) shownJobs = renderGrid(s);
+  if (gridChanged || s.selectedId !== p.selectedId) markSelected(s);
+  if (gridChanged || s.scan.highlight !== p.scan.highlight) applyHighlight(s, s.scan.highlight !== p.scan.highlight);
+  if (gridChanged || s.scan !== p.scan) renderGridNote(s, shownJobs.length);
+  if (s.jobs !== p.jobs) { renderLegend(s); fillCompanies(s); fillRoles(s); }
+  if (s.jobs !== p.jobs || s.scoringOn !== p.scoringOn) renderTops(s);
+  if (s.stats && s.stats !== p.stats) renderStats(s.stats);
+  if (s.crawls !== p.crawls) renderCrawls(s.crawls);
+  const cj = checksJob(s);
+  if (cj !== lastChecks || s.scoringOn !== p.scoringOn) { renderChecks(s, cj); lastChecks = cj; }
+  const sel = jobById(s, s.selectedId);
+  if (sel !== lastSelected || s.statusNote !== p.statusNote || s.skills !== p.skills) {
+    renderSelected(s, sel);
+    lastSelected = sel;
+  }
+  if (s.profile !== p.profile) renderProfile(s.profile);
+  if (s.skills !== p.skills) renderSkills(s.skills);
+  if (s.scan !== p.scan || s.server !== p.server || s.filters.days !== p.filters.days ||
+      (s.server.scanning && s.jobs !== p.jobs)) renderScan(s);
+  if (s.scan.watching !== p.scan.watching || s.scan.elapsed !== p.scan.elapsed) renderTimer(s);
+}
+
+store.subscribe(() => {
+  if (!queued) { queued = true; requestAnimationFrame(draw); }
+});
+
+// --- talking to the server -----------------------------------------------------------
+
+let pollTimer = null;
+async function loadState() {
+  let d;
+  try { d = await fetch("/api/state").then((r) => r.json()); } catch { return; }
+  act().loaded(d);
+  // A scan started elsewhere (another tab, the scheduler, before a reload):
+  // no live stream here, so refresh every 15s until it finishes. Each refresh
+  // adds that batch's jobs to the grid; nothing already shown is removed.
+  clearTimeout(pollTimer);
+  if (d.scanning && !act().scan.watching) pollTimer = setTimeout(loadState, 15000);
+}
+
+async function loadProfile() {
+  try { act().setProfile(await fetch("/api/profile").then((r) => r.json())); } catch { /* panel stays as is */ }
+}
+
+async function loadSkills() {
+  try { act().setSkills(await fetch("/api/skills").then((r) => r.json())); } catch { /* panel stays as is */ }
+}
+
+// Ids matching the text query, resolved server-side so descriptions are
+// searchable without shipping megabytes of them to the browser.
+async function runSearch() {
+  const raw = ($("q").value || "").trim();
+  if (!raw) { act().searched("", null); return; }
+  let ids = null;
+  try {
+    const d = await fetch(`/api/search?q=${encodeURIComponent(raw)}`).then((r) => r.json());
+    ids = d.ids === null ? null : new Set(d.ids);
+  } catch { /* a failed lookup shows everything, not nothing */ }
+  if (($("q").value || "").trim() === raw) act().searched(raw.toLowerCase(), ids);   // not a stale answer
 }
 
 function startScan() {
-  const btn = $("scan");
-  btn.disabled = true; btn.textContent = "Scanning…";
-  t0 = Date.now();
-  timer = setInterval(() => {
-    $("s-time").textContent = ((Date.now() - t0) / 1000).toFixed(1);
-  }, 100);
-
-  watching = true;
-  lockRange(true, undefined, Date.now() / 1000);
-  // full=true: a click reads every company, ignoring refresh_hours and
-  // boards_per_run, so new jobs at already-scanned companies are never missed.
-  // the "posted" filter: only jobs posted in that range are scored
-  // smart: every careers page, every time - companies with India tech jobs first
-  const es = new EventSource(`/api/scan?limit=3000&smart=true&days=${Number($("posted").value || 0)}`);
-  batchNew = 0;
-  $("bb-kept").textContent = "";
-  let active = null;
-
+  act().scanStarted();
+  // smart: every careers page, every time - companies with India tech jobs
+  // first; the "posted" range: only jobs posted in it are scored
+  const es = new EventSource(`/api/scan?limit=3000&smart=true&days=${act().filters.days}`);
   es.onmessage = (ev) => {
     const d = JSON.parse(ev.data);
-    if (d.type === "fetch") {
-      $("lk-company").textContent = d.company;
-      $("lk-title").textContent = d.error ? "fetch failed" : `${d.count} open`;
-      $("lk-score").textContent = "";
-      // Fetching is the long half of a scan. Light up that company's tiles so
-      // the grid shows progress instead of sitting still for two minutes.
-      highlightCompany(d.company);
-    } else if (d.type === "batch") {
-      // One click walks every company, a batch at a time. Jobs from earlier
-      // batches (and earlier scans) stay on the grid; each batch adds to them.
-      const first = d.first ?? (d.index - 1) * 50 + 1;
-      const last = d.last ?? first + d.companies - 1;
-      $("batchbar").hidden = false;
-      $("bb-label").textContent = `Batch ${d.index} of ${d.count}`;
-      $("bb-range").textContent = `· companies ${first}–${last}` + (d.total ? ` of ${d.total}` : "");
-      $("bb-fill").style.width = `${Math.round(((d.index - 1) / d.count) * 100)}%`;
-      $("lk-company").textContent = `batch ${d.index} of ${d.count}`;
-      $("lk-title").textContent = `companies ${first}–${last}`;
-      $("scan").textContent = `Scanning ${d.index}/${d.count}…`;
-    } else if (d.type === "fetched") {
-      loadState();
-      const where = d.batches > 1 ? `batch ${d.batch}/${d.batches}: ` : "";
-      $("gridnote").textContent = `${where}${d.new} new · ${d.closed} closed · ${d.total} kept`;
-      if (d.batches) {
-        $("bb-fill").style.width = `${Math.round((d.batch / d.batches) * 100)}%`;
-      }
-      batchNew += d.new || 0;
-      $("bb-kept").textContent = `${batchNew} new jobs added this scan` +
-        (d.due !== undefined ? ` · ${d.checked} of ${d.due} companies checked` : "");
-    } else if (d.type === "scoring") {
-      const where = d.batches > 1 ? `batch ${d.batch}/${d.batches}: ` : "";
-      $("gridnote").textContent = `${where}scoring ${d.count} of ${d.backlog} unscored`;
-    } else if (d.type === "looking") {
-      clearLit();
-      active = tiles.get(d.id) || null;
-      if (active) {
-        active.classList.add("active");
-        lit.push(active);
-        active.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      }
-      $("lk-company").textContent = d.company;
-      $("lk-title").textContent = d.title;
-      $("lk-score").textContent = "…";
-    } else if (d.type === "scored") {
-      const el = tiles.get(d.id);
-      if (el) {
-        el.className = "tile " + bucket(d.score);
-        el.title = `${d.title} — ${d.company} · ${d.score}/10 — ${d.reason || ""}`;
-      }
-      const j = jobs.find((x) => x.id === d.id);
-      if (j) { j.score = d.score; j.reason = d.reason; j.breakdown = d.breakdown || {}; }
-      $("lk-score").textContent = (d.score / 10).toFixed(2);
-      renderChecks(j || null);
-      renderTops();
-      const scored = jobs.filter((x) => x.score !== null && x.score !== undefined);
-      renderStats({
-        checked: scored.length, total: jobs.length,
-        would_hire: scored.filter((x) => x.score >= 6).length,
-        avg: scored.length ? scored.reduce((a, b) => a + b.score, 0) / scored.length / 10 : 0,
-      });
-    } else if (d.type === "lanes") {
-      // slow careers sites read in their own queue, so the fast ones never wait
-      if (d.slow) $("bb-kept").textContent += ` · slow queue: ${d.slow} sites` +
-        (d.moved ? ` (${d.moved} timed out in the fast queue)` : "");
-    } else if (d.type === "details") {
-      // what reading the postings themselves found, per board
-      $("bb-range").textContent = `· ${d.line}`;
-      $("bb-range").title = (d.errors || []).map(([why, n]) => `${why} ×${n}`).join("\n");
-    } else if (d.type === "throttled") {
-      $("gridnote").textContent = `rate limited after ${d.scored} — press Scan again to continue`;
-    } else if (d.type === "error") {
-      $("gridnote").textContent = d.message;
+    act().scanEvent(d);
+    if (d.type === "fetched") {
+      loadState();                       // that batch's jobs onto the grid
     } else if (d.type === "done") {
-      // Score state only lands in `jobs` via the stream; reload first so the
-      // finale ranks the full board, not just this run's batch.
+      es.close();
+      // reload first so the finale ranks the full board, not just this run's batch
       loadState().then(showMatchMade);
-      $("s-time").textContent = d.elapsed.toFixed(1);
-      $("lk-company").textContent = "idle"; $("lk-title").textContent = ""; $("lk-score").textContent = "";
-      clearLit();
-      es.close(); clearInterval(timer); watching = false;
-      btn.disabled = false; btn.textContent = "Scan";
-      lockRange(false);
-      $("bb-label").textContent = "Scan complete";
-      $("bb-fill").style.width = "100%";
-      loadState();
     }
   };
   es.onerror = () => {
-    clearLit();
-    es.close(); clearInterval(timer); watching = false;
-    btn.disabled = false; btn.textContent = "Scan";
-    lockRange(false);
+    es.close();
+    act().scanLost();
     loadState();
   };
 }
 
 function showMatchMade() {
-  const scored = jobs.filter((j) => j.score !== null && j.score !== undefined);
-  if (!scored.length) return;
-  scored.sort(rankCmp);
-  const top = scored.slice(0, 5);
-
-  const name = $("p-name").textContent;
+  const s = store.getState();
+  const top = topJobs(s);
+  if (!top.length) return;
+  const name = (s.profile && s.profile.name) || $("p-name").textContent;
   const initials = $("avatar").textContent;
   const cards = top.map((j) => `
     <a class="mm-card" href="${escapeHtml(j.url || "#")}" target="_blank" rel="noopener"
@@ -774,7 +708,7 @@ function showMatchMade() {
         <div class="mm-av">${escapeHtml(initials)}</div>
         <div><div class="kicker">Profile</div>
              <div class="pname">${escapeHtml(name)}</div>
-             <div class="pmeta">${escapeHtml($("p-headline").textContent)}</div></div>
+             <div class="pmeta">${escapeHtml((s.profile && s.profile.headline) || "")}</div></div>
       </div>
       <div class="kicker mm-kicker">Match made</div>
       <h2 class="mm-head">High probability of interviewing you</h2>
@@ -798,10 +732,10 @@ function showMatchMade() {
 // engine's Chrome window goes on the left half, so you can watch it and step in.
 function openApplyView(e) {
   e.preventDefault();
-  const s = window.screen;
-  const half = Math.floor(s.availWidth / 2);
-  const left = (s.availLeft || 0) + half, top = s.availTop || 0;
-  const width = s.availWidth - half, height = s.availHeight;
+  const sc = window.screen;
+  const half = Math.floor(sc.availWidth / 2);
+  const left = (sc.availLeft || 0) + half, top = sc.availTop || 0;
+  const width = sc.availWidth - half, height = sc.availHeight;
   const w = window.open("/apply", "jobradar-apply",
                         `popup=yes,left=${left},top=${top},width=${width},height=${height}`);
   if (!w) { location.href = "/apply"; return; }      // pop-ups blocked: same tab
@@ -810,16 +744,8 @@ function openApplyView(e) {
   fetch("/api/apply/arrange", { method: "POST" }).catch(() => {});
 }
 
-$("applylink").onclick = openApplyView;
-$("scan").onclick = startScan;
-$("q").addEventListener("input", onFilterChange);
-$("minscore").addEventListener("change", renderGrid);
-$("co").addEventListener("change", renderGrid);
-$("newonly").addEventListener("change", renderGrid);
-$("posted").addEventListener("change", () => {
-  try { localStorage.setItem("jr-posted", $("posted").value); } catch { /* not kept */ }
-  renderGrid();
-});
+// --- controls -> store ---------------------------------------------------------------
+
 // Every status is filterable, in pipeline order (STATUS_LABEL follows it).
 for (const [st, label] of Object.entries(STATUS_LABEL)) {
   if (st === "not_applied") continue;               // that is "not applied yet"
@@ -827,11 +753,39 @@ for (const [st, label] of Object.entries(STATUS_LABEL)) {
   o.value = st; o.textContent = label;
   $("stfilter").appendChild(o);
 }
-$("stfilter").addEventListener("change", renderGrid);
-$("rolefilter").addEventListener("change", renderGrid);
-$("q").addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { $("q").value = ""; searchIds = null; renderGrid(); }
+
+const FILTER_CONTROLS = [
+  ["minscore", "min", (el) => Number(el.value || 0)],
+  ["co", "company", (el) => el.value || ""],
+  ["newonly", "newOnly", (el) => el.checked],
+  ["stfilter", "status", (el) => el.value || ""],
+  ["rolefilter", "role", (el) => el.value || ""],
+];
+for (const [id, key, read] of FILTER_CONTROLS) {
+  $(id).addEventListener("change", () => act().setFilter(key, read($(id))));
+  act().setFilter(key, read($(id)));                // a value the browser restored on reload
+}
+
+// Your last range comes back after a reload (only in this browser).
+if (![...$("posted").options].some((o) => o.value === String(act().filters.days))) act().setFilter("days", 0);
+$("posted").addEventListener("change", () => {
+  try { localStorage.setItem("jr-posted", $("posted").value); } catch { /* not kept */ }
+  act().setFilter("days", Number($("posted").value || 0));
 });
+
+let debounce = null;
+$("q").addEventListener("input", () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(runSearch, 220);
+});
+$("q").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { $("q").value = ""; act().searched("", null); }
+});
+
+$("applylink").onclick = openApplyView;
+$("scan").onclick = startScan;
+
+draw();
 loadProfile();
 loadSkills();
 loadState();
