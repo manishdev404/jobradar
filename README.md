@@ -106,6 +106,15 @@ Find a company's board and slug in its careers URL:
 `install.sh` registers two launchd jobs: daily alerts at 09:30, weekly digest
 Mondays at 09:00.
 
+## Google Sheet tracker
+
+Setting a job to **Applied** (main page or History) can also add it to a Google
+Sheet tab, or update its row if the link is already there. It uses a small Apps
+Script in the sheet itself, so no Google Cloud key is needed: follow the steps
+at the top of [docs/sheet-sync.gs](docs/sheet-sync.gs), put
+`JOBRADAR_SHEET_URL` and `JOBRADAR_SHEET_TOKEN` in `.env`, restart the web app,
+and check it with `python -m jobradar.sheet`.
+
 ## Token budget
 
 Free tiers have a daily cap, so the budget is checked before every request and

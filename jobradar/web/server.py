@@ -7,6 +7,7 @@ light up as they are scored.
 from __future__ import annotations
 
 import json
+import mimetypes
 import queue
 import threading
 import time
@@ -17,7 +18,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import sources
+from .. import sheet, sources
 from ..cursor import CursorError
 from ..llm import RateLimited
 from ..main import (ROOT, boards_due, details_report, fetch_boards, get_profile, get_scorer,
@@ -28,6 +29,9 @@ from ..seniority import apply_cap
 from ..store import STATUSES, Store
 
 STATIC = Path(__file__).parent / "static"
+# The page loads as ES modules (app.js, store.js), which browsers run only when
+# served as JavaScript; some Windows registries map .js to text/plain.
+mimetypes.add_type("text/javascript", ".js")
 app = FastAPI(title="Job Radar")
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
@@ -74,15 +78,30 @@ def statuses():
     return {"statuses": list(STATUSES)}
 
 
+def _to_sheet(s: Store, app_id: int, was: str | None) -> str:
+    """A move to "applied" also goes into the Google Sheet tracker (sheet.py).
+    Returns what happened there, "" when nothing was sent."""
+    row = s.db.execute("SELECT * FROM applications WHERE id = ?", (app_id,)).fetchone()
+    if row is None or row["status"] != "applied" or was == "applied" or not sheet.enabled():
+        return ""
+    job = s.db.execute("SELECT * FROM jobs WHERE id = ?", (row["job_id"],)).fetchone()
+    skills = cfg().get("skills") or {}
+    mine = list(skills.get("top") or []) + list(skills.get("good") or [])
+    return sheet.record_applied(sheet.entry(dict(row), dict(job) if job else None, mine))
+
+
 @app.post("/api/jobs/{job_id}/status")
 def job_status(job_id: str, body: StatusIn):
+    s = store()
+    before = s.application_for(job_id)
     try:
-        app_id = store().set_job_status(job_id, body.status, body.notes)
+        app_id = s.set_job_status(job_id, body.status, body.notes)
     except KeyError:
         raise HTTPException(404, "no such job")
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"id": app_id, "status": body.status}
+    return {"id": app_id, "status": body.status,
+            "sheet": _to_sheet(s, app_id, before["status"] if before else None)}
 
 
 @app.get("/api/applications")
@@ -100,23 +119,27 @@ def applications():
 def add_application(body: ApplicationIn):
     if not body.company.strip():
         raise HTTPException(400, "company is required")
+    s = store()
     try:
-        app_id = store().add_application(body.company, body.title, body.url, body.status,
-                                         notes=body.notes, location=body.location)
+        app_id = s.add_application(body.company, body.title, body.url, body.status,
+                                   notes=body.notes, location=body.location)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"id": app_id}
+    return {"id": app_id, "sheet": _to_sheet(s, app_id, None)}
 
 
 @app.patch("/api/applications/{app_id}")
 def update_application(app_id: int, body: StatusIn):
+    s = store()
+    before = s.db.execute("SELECT status FROM applications WHERE id = ?", (app_id,)).fetchone()
     try:
-        store().update_application(app_id, body.status, body.notes)
+        s.update_application(app_id, body.status, body.notes)
     except KeyError:
         raise HTTPException(404, "no such application")
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"id": app_id, "status": body.status}
+    return {"id": app_id, "status": body.status,
+            "sheet": _to_sheet(s, app_id, before["status"] if before else None)}
 
 
 @app.delete("/api/applications/{app_id}")

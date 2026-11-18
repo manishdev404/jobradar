@@ -136,8 +136,9 @@ function row(a) {
   const st = cell(tr);
   st.appendChild(statusSelect(a.status, async (status, sel) => {
     try {
-      await api(`/api/applications/${a.id}`, "PATCH", { status });
+      const done = await api(`/api/applications/${a.id}`, "PATCH", { status });
       await load();
+      if (done.sheet && done.sheet.startsWith("Google Sheet not updated")) alert(done.sheet);
     } catch (e) {
       sel.value = a.status;
       alert(`Not saved: ${e.message}`);
@@ -223,9 +224,10 @@ function setupAddForm() {
     e.preventDefault();
     const f = new FormData(e.target);
     try {
-      await api("/api/applications", "POST", Object.fromEntries(f.entries()));
+      const done = await api("/api/applications", "POST", Object.fromEntries(f.entries()));
       e.target.reset(); sel.value = "applied";
       await load();
+      if (done.sheet && done.sheet.startsWith("Google Sheet not updated")) alert(done.sheet);
     } catch (err) {
       alert(`Not added: ${err.message}`);
     }
