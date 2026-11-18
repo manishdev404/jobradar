@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import smtplib
+import ssl
 import time
 from email.message import EmailMessage
 from html import escape
@@ -101,16 +102,25 @@ def send(cfg: dict, subject: str, html: str, text: str) -> None:
 
     try:
         with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=30) as s:
-            s.starttls()
-            s.login(cfg["from"], password)
+            s.starttls(context=ssl.create_default_context())   # verify it is really the server
+            s.ehlo()
+            if "PLAIN" in s.esmtp_features.get("auth", "").upper().split():
+                # One method only. login() tries PLAIN and then LOGIN, and Gmail
+                # hangs up after refusing the first, so the retry swaps Gmail's
+                # real answer ("535 Username and Password not accepted") for a
+                # bare "connection closed".
+                s.user, s.password = cfg["from"], password
+                s.auth("PLAIN", s.auth_plain)
+            else:
+                s.login(cfg["from"], password)
             s.send_message(msg)
     except (smtplib.SMTPAuthenticationError, smtplib.SMTPServerDisconnected) as e:
-        # Gmail hangs up rather than answering when the app password is wrong,
-        # so a bare disconnect here almost always means bad credentials.
+        said = (e.smtp_error.decode(errors="replace").replace("\n", " ")
+                if isinstance(e, smtplib.SMTPAuthenticationError) else type(e).__name__)
         raise RuntimeError(
-            f"Gmail rejected the login for {cfg['from']}. Check that:\n"
-            f"  - the app password is the bare 16 characters (spaces are stripped for you)\n"
-            f"  - email.from in config.yaml is the same account that generated it\n"
-            f"  - 2-Step Verification is still on for that account\n"
-            f"(underlying: {type(e).__name__})"
+            f"Gmail rejected the login for {cfg['from']}: {said}\n"
+            f"Fix: make a new App Password at https://myaccount.google.com/apppasswords\n"
+            f"(signed in as {cfg['from']}) and put it in .env as JOBRADAR_SMTP_PASSWORD.\n"
+            f"An app password stops working when the Google password is changed, when it is\n"
+            f"deleted, or when 2-Step Verification is turned off."
         ) from e
